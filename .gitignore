@@ -1,0 +1,22 @@
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# JavaScript
+node_modules/
+web/dist/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.ruff_cache/
+.ty/
+
+# Local data
+postgres-data/

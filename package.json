@@ -1,0 +1,25 @@
+{
+  "name": "margin",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "bun@1.2.16",
+  "workspaces": [
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n web,api -c cyan,magenta \"bun run --filter web dev\" \"uv run --directory api fastapi dev main.py --host 127.0.0.1\"",
+    "dev:web": "bun run --filter web dev",
+    "dev:api": "uv run --directory api fastapi dev main.py --host 127.0.0.1",
+    "db:up": "docker compose up -d db",
+    "db:down": "docker compose down",
+    "lint": "bun run --filter web lint && uv run --directory api ruff check .",
+    "format": "prettier --write \"web/**/*.{ts,tsx,js,jsx,css,json,md}\" \"*.{json,md,yml,yaml}\" && uv run --directory api ruff format .",
+    "format:check": "prettier --check \"web/**/*.{ts,tsx,js,jsx,css,json,md}\" \"*.{json,md,yml,yaml}\" && uv run --directory api ruff format --check .",
+    "typecheck": "bun run --filter web build && uv run --directory api ty check",
+    "check": "bun run lint && bun run format:check && bun run typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "prettier": "^3.6.2"
+  }
+}
