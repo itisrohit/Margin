@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-margin}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-margin}
     ports:
-      - '5432:5432'
+      - '${POSTGRES_PORT:-5432}:5432'
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./api/init/01-enable-vector.sql:/docker-entrypoint-initdb.d/01-enable-vector.sql:ro
@@ -18,7 +18,65 @@ services:
         ]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-margin}:${POSTGRES_PASSWORD:-margin}@db:5432/${POSTGRES_DB:-margin}
+    ports:
+      - '${API_PORT:-8000}:8000'
+    volumes:
+      - ./api:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'python',
+          '-c',
+          "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    environment:
+      VITE_API_URL: http://127.0.0.1:${API_PORT:-8000}
+    ports:
+      - '${WEB_PORT:-5173}:5173'
+    volumes:
+      - ./web:/app/web
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:5173').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
 
 volumes:
   postgres-data:
