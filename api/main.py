@@ -3,6 +3,7 @@ import io
 import queue
 import wave
 from collections.abc import Iterator
+from contextlib import asynccontextmanager
 from typing import Any, TypedDict
 
 import grpc
@@ -19,9 +20,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
 from articles import router as articles_router
+from companion import close_client
+from companion import router as companion_router
 from memory import router as memory_router
 
-app = FastAPI(title="Margin API", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await close_client()
+
+
+app = FastAPI(title="Margin API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,6 +42,7 @@ app.add_middleware(
 )
 app.include_router(memory_router)
 app.include_router(articles_router)
+app.include_router(companion_router)
 
 
 class SpeechModel(TypedDict):

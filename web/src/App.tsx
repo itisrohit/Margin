@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 import { ArticleOutline } from './ArticleOutline'
+import { Companion, type VoiceQuestion } from './Companion'
 
 type ImportedArticle = {
   url: string
@@ -735,6 +736,18 @@ function App() {
   const [articleError, setArticleError] = useState('')
   const [library, setLibrary] = useState<ImportedArticle[]>(loadLibrary)
   const [libraryOpen, setLibraryOpen] = useState(false)
+  const [captureMode, setCaptureMode] = useState<'thought' | 'ask'>('thought')
+  const [voiceQuestion, setVoiceQuestion] = useState<VoiceQuestion | null>(null)
+  const [voiceDraft, setVoiceDraft] = useState('')
+  const releasedAtRef = useRef(0)
+  const [companionArticle] = useState(
+    () =>
+      importedArticle ?? {
+        url: 'margin:sample',
+        title: 'A little room for thought',
+        paragraphs,
+      },
+  )
   const [largeText, setLargeText] = useState(false)
   const [marginOpen, setMarginOpen] = useState(false)
   const [readingPositions, setReadingPositions] = useState(loadReadingPositions)
@@ -1458,7 +1471,7 @@ function App() {
       voiceHoldRef.current = false
       return
     }
-    if (activeParagraphIndex === null) {
+    if (activeParagraphIndex === null && captureMode !== 'ask') {
       setVoiceError('Select a passage before recording a thought.')
       setVoiceState('error')
       voiceHoldRef.current = false
@@ -1471,7 +1484,7 @@ function App() {
       return
     }
 
-    const paragraphIndex = activeParagraphIndex
+    const paragraphIndex = activeParagraphIndex ?? 0
     let stream: MediaStream | null = null
     try {
       if (!navigator.mediaDevices?.getUserMedia) {
@@ -1538,6 +1551,10 @@ function App() {
           }
           if (result.type === 'transcript' && result.text) {
             capture.latestText = result.text
+            if (captureMode === 'ask') {
+              setVoiceDraft(result.text)
+              return
+            }
             setNoteDraft(
               isVoiceEditing && voiceEditSelection
                 ? replaceTextRange(
@@ -1551,7 +1568,14 @@ function App() {
           } else if (result.type === 'done') {
             const transcript = (result.text || capture.latestText).trim()
             if (transcript) {
-              if (isVoiceEditing && voiceEditSelection) {
+              if (captureMode === 'ask') {
+                setVoiceDraft('')
+                setVoiceQuestion({
+                  text: transcript,
+                  id: Date.now(),
+                  releasedAt: releasedAtRef.current,
+                })
+              } else if (isVoiceEditing && voiceEditSelection) {
                 applyVoiceEditReplacement(transcript)
               } else {
                 const updatedNote = appendTranscript(
@@ -1687,7 +1711,14 @@ function App() {
               )
 
             const existingNote = notes[paragraphIndex] ?? ''
-            if (isVoiceEditing && voiceEditSelection) {
+            if (captureMode === 'ask') {
+              setVoiceDraft('')
+              setVoiceQuestion({
+                text: transcript,
+                id: Date.now(),
+                releasedAt: releasedAtRef.current,
+              })
+            } else if (isVoiceEditing && voiceEditSelection) {
               applyVoiceEditReplacement(transcript)
             } else {
               const updatedNote = appendTranscript(existingNote, transcript)
@@ -1737,6 +1768,7 @@ function App() {
   }, [
     activeParagraphIndex,
     applyVoiceEditReplacement,
+    captureMode,
     isVoiceEditing,
     notes,
     persistNotes,
@@ -1747,6 +1779,7 @@ function App() {
   ])
 
   const stopVoiceCapture = useCallback(() => {
+    releasedAtRef.current = performance.now()
     voiceHoldRef.current = false
     const liveCapture = liveCaptureRef.current
     if (liveCapture) {
@@ -1771,8 +1804,14 @@ function App() {
       const target = event.target
       if (
         target instanceof HTMLElement &&
-        target.closest(
-          'input, textarea, select, [contenteditable="true"], button:not(.voice-capture):not(.voice-edit-word)',
+        target.closest('input, textarea, select, [contenteditable="true"]')
+      )
+        return
+      if (
+        target instanceof HTMLElement &&
+        target.closest('button, a, summary') &&
+        !target.closest(
+          '.voice-capture, .voice-edit-word, .capture-mode, .companion-panel',
         )
       )
         return
@@ -1797,9 +1836,17 @@ function App() {
         stopVoiceCapture()
       }
     }
+    const releaseOnBlur = () => {
+      if (holdSourceRef.current === 'keyboard') {
+        holdSourceRef.current = null
+        stopVoiceCapture()
+      }
+    }
+    window.addEventListener('blur', releaseOnBlur)
     window.addEventListener('keydown', handleKeyDown)
     window.addEventListener('keyup', handleKeyUp)
     return () => {
+      window.removeEventListener('blur', releaseOnBlur)
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('keyup', handleKeyUp)
     }
@@ -1816,7 +1863,7 @@ function App() {
 
   return (
     <div
-      className={`app-shell${isEditingNote ? ' is-note-editing' : ''}${largeText ? ' is-large-text' : ''}${marginOpen ? ' is-margin-open' : ''}`}
+      className={`app-shell${isEditingNote ? ' is-note-editing' : ''}${largeText ? ' is-large-text' : ''}${marginOpen ? ' is-margin-open' : ''}${captureMode === 'ask' ? ' is-asking' : ''}`}
     >
       <header className="topbar">
         <a
@@ -2076,6 +2123,67 @@ function App() {
             >
               Close thoughts <span aria-hidden="true">↓</span>
             </button>
+            <div className="capture-mode" aria-label="Voice action">
+              <button
+                type="button"
+                aria-pressed={captureMode === 'thought'}
+                disabled={
+                  voiceState === 'recording' || voiceState === 'transcribing'
+                }
+                onClick={() => setCaptureMode('thought')}
+              >
+                Leave a thought
+              </button>
+              <button
+                type="button"
+                aria-pressed={captureMode === 'ask'}
+                disabled={
+                  voiceState === 'recording' || voiceState === 'transcribing'
+                }
+                onClick={() => {
+                  setCaptureMode('ask')
+                  setIsVoiceEditing(false)
+                  setIsEditingNote(false)
+                }}
+              >
+                Ask Margin
+              </button>
+            </div>
+            {captureMode === 'ask' && (
+              <Companion
+                apiUrl={API_URL}
+                apiKey={speechSettings.apiKey}
+                clientId={getClientId()}
+                article={companionArticle}
+                library={library}
+                paragraphIndex={activeParagraphIndex ?? 0}
+                voiceQuestion={voiceQuestion}
+                voiceDraft={voiceDraft}
+                onNavigate={(source) => {
+                  if (source.url === companionArticle.url) {
+                    selectParagraph(source.paragraphIndex)
+                    document
+                      .querySelector(
+                        `[data-paragraph-index="${source.paragraphIndex}"]`,
+                      )
+                      ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+                  } else {
+                    const saved = library.find((a) => a.url === source.url)
+                    if (saved) {
+                      const positions = {
+                        ...readingPositions,
+                        [saved.url]: source.paragraphIndex,
+                      }
+                      localStorage.setItem(
+                        READING_POSITION_KEY,
+                        JSON.stringify(positions),
+                      )
+                      openSavedArticle(saved)
+                    }
+                  }
+                }}
+              />
+            )}
             <div className="rail-heading">
               <span className="rail-label">
                 {focusedParagraph ? 'IN FOCUS' : 'YOUR MARGIN'}
@@ -2166,7 +2274,7 @@ function App() {
                   Add an NVIDIA key in Settings to find returning thoughts.
                 </p>
               )}
-            {activeParagraphIndex !== null && (
+            {(activeParagraphIndex !== null || captureMode === 'ask') && (
               <button
                 className={`voice-capture${voiceState === 'recording' ? ' is-recording' : ''}`}
                 type="button"
@@ -2210,7 +2318,9 @@ function App() {
                 {voiceState === 'recording'
                   ? isVoiceEditing
                     ? 'Release to replace selection'
-                    : 'Release to finish thought'
+                    : captureMode === 'ask'
+                      ? 'Release to ask Margin'
+                      : 'Release to finish thought'
                   : voiceState === 'transcribing'
                     ? 'Transcribing…'
                     : isVoiceEditing
@@ -2218,7 +2328,9 @@ function App() {
                         ? 'Hold to replace selection'
                         : 'Choose a word to edit'
                       : speechSettings.apiKey
-                        ? 'Hold to speak a thought'
+                        ? captureMode === 'ask'
+                          ? 'Hold to ask Margin'
+                          : 'Hold to speak a thought'
                         : 'Add API key to speak'}
               </button>
             )}
@@ -2230,9 +2342,13 @@ function App() {
                 {voiceState === 'recording'
                   ? isVoiceEditing
                     ? 'Listening — release to replace the selected words.'
-                    : 'Listening — release to finish your thought.'
+                    : captureMode === 'ask'
+                      ? 'Listening — release to ask Margin.'
+                      : 'Listening — release to finish your thought.'
                   : voiceState === 'transcribing'
-                    ? 'Writing your thought in the margin…'
+                    ? captureMode === 'ask'
+                      ? 'Finishing your question…'
+                      : 'Writing your thought in the margin…'
                     : voiceError}
               </div>
             )}
