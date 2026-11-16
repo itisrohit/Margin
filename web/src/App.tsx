@@ -1,14 +1,45 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 
-const NOTES_STORAGE_KEY = 'margin:sample-essay:notes'
+type ImportedArticle = {
+  url: string
+  title: string
+  author: string | null
+  paragraphs: string[]
+  blocks?: { type: string; text: string }[]
+}
+function loadArticle(): ImportedArticle | null {
+  try {
+    const value = JSON.parse(
+      localStorage.getItem('margin:current-article') ?? 'null',
+    )
+    if (
+      value &&
+      typeof value.url === 'string' &&
+      typeof value.title === 'string' &&
+      Array.isArray(value.paragraphs) &&
+      value.paragraphs.length &&
+      value.paragraphs.every((p: unknown) => typeof p === 'string')
+    )
+      return value
+  } catch {
+    /* Use the sample when storage is unavailable. */
+  }
+  return null
+}
+const importedArticle = loadArticle()
+const articleSuffix = importedArticle
+  ? `:${encodeURIComponent(importedArticle.url)}`
+  : ''
+const NOTES_STORAGE_KEY = 'margin:sample-essay:notes' + articleSuffix
 const SPEECH_SETTINGS_KEY = 'margin:speech-settings'
-const SPEECH_REVIEW_KEY = 'margin:sample-essay:speech-review'
-const THOUGHT_DATES_KEY = 'margin:thought-dates'
-const DISMISSED_CONNECTIONS_KEY = 'margin:dismissed-connections'
+const SPEECH_REVIEW_KEY = 'margin:sample-essay:speech-review' + articleSuffix
+const THOUGHT_DATES_KEY = 'margin:thought-dates' + articleSuffix
+const DISMISSED_CONNECTIONS_KEY = 'margin:dismissed-connections' + articleSuffix
 const CLIENT_ID_KEY = 'margin:client-id'
-const ARTICLE_KEY = 'margin-sample-essay'
-const ARTICLE_TITLE = 'The quiet value of an unfinished thought'
+const ARTICLE_KEY = importedArticle?.url ?? 'margin-sample-essay'
+const ARTICLE_TITLE =
+  importedArticle?.title ?? 'The quiet value of an unfinished thought'
 
 const speechModels = [
   {
@@ -413,7 +444,7 @@ function locateReviewRange(
   return null
 }
 
-const paragraphs = [
+const paragraphs = importedArticle?.paragraphs ?? [
   'We tend to treat a thought as a thing that arrives finished. It appears, clear and self-contained, and we decide whether to keep it or let it go. But most ideas begin less like sentences and more like weather: a change in pressure, a small disturbance at the edge of attention.',
   'Reading gives those unfinished thoughts somewhere to land. A line in an essay can meet an experience we have not yet put into words. For a moment, the page and our own memory seem to be talking about the same thing.',
   'Usually we move on. The next paragraph arrives, then another, and the thought slips back into the noise of the day. We may remember that something mattered without remembering what it made us think.',
@@ -642,6 +673,9 @@ function BrandMark() {
 }
 
 function App() {
+  const [articleUrl, setArticleUrl] = useState('')
+  const [articleLoading, setArticleLoading] = useState(false)
+  const [articleError, setArticleError] = useState('')
   const [activeParagraphIndex, setActiveParagraphIndex] = useState<
     number | null
   >(null)
@@ -698,6 +732,38 @@ function App() {
   }>({ apiKey: '', notes: {} })
   const voiceHoldRef = useRef(false)
   const holdSourceRef = useRef<'keyboard' | 'pointer' | null>(null)
+
+  const openArticle = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setArticleLoading(true)
+    setArticleError('')
+    try {
+      const response = await fetch(`${API_URL}/articles/extract`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(speechSettings.apiKey
+            ? { Authorization: `Bearer ${speechSettings.apiKey}` }
+            : {}),
+        },
+        body: JSON.stringify({ url: articleUrl.trim() }),
+      })
+      const result = await response.json()
+      if (!response.ok)
+        throw new Error(
+          typeof result.detail === 'string'
+            ? result.detail
+            : 'Could not open this article.',
+        )
+      localStorage.setItem('margin:current-article', JSON.stringify(result))
+      window.location.reload()
+    } catch (error) {
+      setArticleError(
+        error instanceof Error ? error.message : 'Could not open this article.',
+      )
+      setArticleLoading(false)
+    }
+  }
 
   const focusedParagraphIndex = activeParagraphIndex
   const focusedParagraph =
@@ -855,7 +921,9 @@ function App() {
                 paragraphText: paragraphs[index],
                 paragraphIndex: index,
                 articleTitle: ARTICLE_TITLE,
-                articleUrl: `${window.location.origin}${window.location.pathname}`,
+                articleUrl:
+                  importedArticle?.url ??
+                  `${window.location.origin}${window.location.pathname}`,
                 createdAt: thoughtDates[index] ?? new Date().toISOString(),
               }),
             },
@@ -1658,36 +1726,104 @@ function App() {
         </button>
       </header>
 
+      <form
+        className="article-import"
+        onSubmit={(event) => void openArticle(event)}
+      >
+        <label htmlFor="article-url">What would you like to read?</label>
+        <div className="article-import-row">
+          <input
+            id="article-url"
+            type="url"
+            required
+            placeholder="Paste an article link"
+            value={articleUrl}
+            onChange={(event) => setArticleUrl(event.target.value)}
+            disabled={articleLoading}
+          />
+          <button type="submit" disabled={articleLoading}>
+            {articleLoading ? 'Opening…' : 'Open article'}
+          </button>
+        </div>
+        {articleError && <p role="alert">{articleError}</p>}
+        {importedArticle && (
+          <button
+            type="button"
+            className="text-button"
+            onClick={() => {
+              localStorage.removeItem('margin:current-article')
+              window.location.reload()
+            }}
+          >
+            Read the sample essay
+          </button>
+        )}
+      </form>
       <main className="reader-layout" id="top">
         <article className="article">
           <div className="article-heading">
             <p className="eyebrow">A NOTE ON READING</p>
-            <h1>The quiet value of an unfinished thought</h1>
-            <p className="dek">
-              Reading is more than taking in someone else’s words. It is a
-              chance to notice what those words stir in you.
-            </p>
+            <h1>{ARTICLE_TITLE}</h1>
+            {!importedArticle && (
+              <p className="dek">
+                Reading is more than taking in someone else’s words. It is a
+                chance to notice what those words stir in you.
+              </p>
+            )}
             <div className="byline">
               <span className="byline-avatar" aria-hidden="true">
                 M
               </span>
-              <span className="byline-name">Margin sample</span>
+              <span className="byline-name">
+                {importedArticle
+                  ? (importedArticle.author ??
+                    new URL(importedArticle.url).hostname)
+                  : 'Margin sample'}
+              </span>
               <span className="byline-separator" aria-hidden="true">
                 ·
               </span>
-              <span>4 min read</span>
+              <span>
+                {Math.max(
+                  1,
+                  Math.ceil(paragraphs.join(' ').split(/\s+/).length / 220),
+                )}{' '}
+                min read
+              </span>
               <span className="byline-separator" aria-hidden="true">
                 ·
               </span>
-              <span>Demo essay</span>
+              <span>
+                {importedArticle ? (
+                  <a
+                    href={importedArticle.url}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Original article ↗
+                  </a>
+                ) : (
+                  'Demo essay'
+                )}
+              </span>
             </div>
           </div>
 
           <div className="article-body">
             {paragraphs.map((paragraph, index) => (
-              <p
-                key={paragraph}
-                className={`article-paragraph${focusedParagraphIndex === index ? ' is-active' : ''}`}
+              <div
+                key={`${index}-${paragraph}`}
+                role={
+                  importedArticle?.blocks?.[index]?.type === 'heading'
+                    ? 'heading'
+                    : undefined
+                }
+                aria-level={
+                  importedArticle?.blocks?.[index]?.type === 'heading'
+                    ? 2
+                    : undefined
+                }
+                className={`article-paragraph article-block-${importedArticle?.blocks?.[index]?.type ?? 'paragraph'}${focusedParagraphIndex === index ? ' is-active' : ''}`}
                 data-paragraph-index={index}
                 tabIndex={0}
                 onMouseEnter={() => {
@@ -1703,13 +1839,13 @@ function App() {
                 }}
               >
                 {paragraph}
-              </p>
+              </div>
             ))}
           </div>
 
           <footer className="article-footer">
             <span className="footer-rule" />
-            <span>You’ve reached the end of this sample.</span>
+            <span>You’ve reached the end.</span>
             <span className="footer-rule" />
           </footer>
         </article>

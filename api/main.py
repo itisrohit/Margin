@@ -18,6 +18,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
+from articles import router as articles_router
 from memory import router as memory_router
 
 app = FastAPI(title="Margin API", version="0.1.0")
@@ -30,6 +31,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(memory_router)
+app.include_router(articles_router)
 
 
 class SpeechModel(TypedDict):
