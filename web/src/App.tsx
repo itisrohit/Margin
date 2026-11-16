@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import './App.css'
 
 const paragraphs = [
@@ -18,6 +19,23 @@ function BrandMark() {
 }
 
 function App() {
+  const [activeParagraphIndex, setActiveParagraphIndex] = useState<
+    number | null
+  >(null)
+  const activeParagraph =
+    activeParagraphIndex === null ? null : paragraphs[activeParagraphIndex]
+
+  const restoreFocusedParagraph = () => {
+    const focusedIndex = document.activeElement
+      ?.closest('[data-paragraph-index]')
+      ?.getAttribute('data-paragraph-index')
+    setActiveParagraphIndex(
+      focusedIndex === null || focusedIndex === undefined
+        ? null
+        : Number(focusedIndex),
+    )
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -57,8 +75,27 @@ function App() {
           </div>
 
           <div className="article-body">
-            {paragraphs.map((paragraph) => (
-              <p key={paragraph}>{paragraph}</p>
+            {paragraphs.map((paragraph, index) => (
+              <p
+                key={paragraph}
+                className={`article-paragraph${activeParagraphIndex === index ? ' is-active' : ''}`}
+                data-paragraph-index={index}
+                tabIndex={0}
+                onMouseEnter={() => setActiveParagraphIndex(index)}
+                onMouseLeave={restoreFocusedParagraph}
+                onFocus={() => setActiveParagraphIndex(index)}
+                onBlur={(event) => {
+                  if (
+                    !event.currentTarget.parentElement?.contains(
+                      event.relatedTarget,
+                    )
+                  ) {
+                    setActiveParagraphIndex(null)
+                  }
+                }}
+              >
+                {paragraph}
+              </p>
             ))}
           </div>
 
@@ -71,16 +108,28 @@ function App() {
 
         <aside className="margin-rail" aria-label="Margin notes">
           <div className="rail-heading">
-            <span className="rail-label">YOUR MARGIN</span>
-            <span className="rail-count">—</span>
+            <span className="rail-label">
+              {activeParagraph ? 'IN FOCUS' : 'YOUR MARGIN'}
+            </span>
+            <span className="rail-count">
+              {activeParagraphIndex === null
+                ? '—'
+                : `${String(activeParagraphIndex + 1).padStart(2, '0')} / ${String(paragraphs.length).padStart(2, '0')}`}
+            </span>
           </div>
           <div className="rail-empty">
             <span className="rail-spark" aria-hidden="true">
               ✳
             </span>
-            <p className="rail-title">A little room to think.</p>
+            <p className="rail-title">
+              {activeParagraph
+                ? `Passage ${activeParagraphIndex! + 1}`
+                : 'A little room to think.'}
+            </p>
             <p className="rail-copy">
-              Your thoughts will sit beside the words that sparked them.
+              {activeParagraph
+                ? `“${activeParagraph.slice(0, 100)}${activeParagraph.length > 100 ? '…' : ''}”`
+                : 'Your thoughts will sit beside the words that sparked them.'}
             </p>
           </div>
           <p className="rail-footnote">

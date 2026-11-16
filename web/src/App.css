@@ -135,13 +135,35 @@
   padding-top: 29px;
 }
 
-.article-body p {
-  margin: 0 0 25px;
+.article-paragraph {
+  position: relative;
+  margin: 0 0 25px -14px;
+  padding: 4px 12px;
+  border-left: 2px solid transparent;
+  border-radius: 2px;
   color: #393b35;
   font-family: var(--serif);
   font-size: 18px;
   line-height: 1.86;
   letter-spacing: 0.002em;
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease;
+}
+
+.article-paragraph:hover,
+.article-paragraph.is-active {
+  border-left-color: var(--accent);
+  background: #f0ece3;
+}
+
+.article-paragraph:focus-visible {
+  outline: 2px solid rgba(186, 105, 76, 0.55);
+  outline-offset: 3px;
+}
+
+.article-paragraph:last-child {
+  margin-bottom: 0;
 }
 
 .article-footer {
@@ -284,7 +306,7 @@
     font-size: 18px;
   }
 
-  .article-body p {
+  .article-paragraph {
     font-size: 17px;
     line-height: 1.78;
   }
