@@ -44,6 +44,33 @@ class ChatSource(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class ChatStep(BaseModel):
+    """One lookup the agent made while answering, kept so reopened chats show it."""
+
+    id: int = Field(ge=0)
+    tool: str = Field(max_length=40)
+    status: Literal["running", "done", "error"]
+    query: str | None = Field(default=None, max_length=300)
+    results: int | None = Field(default=None, ge=0)
+    paragraph_index: int | None = Field(default=None, alias="paragraphIndex", ge=0)
+    title: str | None = Field(default=None, max_length=300)
+    detail: str | None = Field(default=None, max_length=300)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ChatProposal(BaseModel):
+    """A note the agent drafted. Saving happens only when the reader approves it."""
+
+    id: str = Field(max_length=40)
+    paragraph_index: int = Field(alias="paragraphIndex", ge=0)
+    source_id: int | None = Field(default=None, alias="sourceId")
+    text: str = Field(min_length=1, max_length=1000)
+    status: Literal["pending", "approved", "rejected"]
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class ChatTurn(BaseModel):
     id: float
     question: str = Field(min_length=1, max_length=2000)
@@ -56,6 +83,8 @@ class ChatTurn(BaseModel):
     )
     quote: str | None = Field(default=None, max_length=1500)
     paragraph_index: int | None = Field(default=None, alias="paragraphIndex", ge=0)
+    steps: list[ChatStep] = Field(default_factory=list, max_length=16)
+    proposal: ChatProposal | None = None
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -118,13 +147,18 @@ def list_chats_sync(client_id: UUID, article_url: str) -> list[dict[str, object]
 def save_chat_sync(chat_id: str, chat: ChatInput) -> None:
     ensure_chat_schema()
     # An answer still streaming when saved is incomplete; store it as stopped.
-    turns = [
-        {
-            **turn.model_dump(by_alias=True, exclude_none=True),
-            "status": "stopped" if turn.status == "streaming" else turn.status,
-        }
-        for turn in chat.turns
-    ]
+    # Likewise a lookup still running when saved never finished.
+    turns = []
+    for turn in chat.turns:
+        saved = turn.model_dump(by_alias=True, exclude_none=True)
+        saved["status"] = "stopped" if turn.status == "streaming" else turn.status
+        saved["steps"] = [
+            {**step, "status": "error", "detail": "Interrupted."}
+            if step["status"] == "running"
+            else step
+            for step in saved.get("steps", [])
+        ]
+        turns.append(saved)
     updated_at = chat.updated_at if chat.updated_at.tzinfo else chat.updated_at.replace(tzinfo=UTC)
     values = {
         "client_id": chat.client_id,

@@ -18,3 +18,27 @@ With six passage and seven library samples, nearest-rank p95 is the maximum obse
 Checks: 18 automated tests passed, including PostgreSQL integration; backend lint/types and frontend lint/build passed. No browser UI or microphone verification was performed.
 
 The reader exposes Ask Margin, passage/library scope, source links, cancellation, and Response timings. There is no spoken answer playback. Exact vector search remains in use; large-library indexes and reranking need a larger labeled benchmark.
+
+## Agent mode (tool calling)
+
+**Not yet measured live.** Agent mode (`MARGIN_AGENT=1`, see `docs/companion.md`) was
+built and tested offline only: 22 new unit/integration tests with a mocked model cover
+tool scoping by reader and article, the step cap, tool errors, fallback when tool calling
+is rejected, citation stripping, and `propose_note` never writing. No NVIDIA key was
+available while building it, so there are no tool-selection or latency numbers yet.
+
+NVIDIA's model card lists function calling (including parallel calls) as supported for
+`nvidia/nemotron-3.5-bolt-e4b`; whether the hosted model chooses tools reliably for these
+questions is exactly what the eval checks.
+
+To measure: start the API with `MARGIN_AGENT=1`, then run
+`NVIDIA_API_KEY=... uv run --directory api python benchmarks/agent_eval.py`. It writes
+`api/benchmarks/results/agent_eval.json` and reports tool-selection accuracy, average
+steps, the share of answers whose citations are all valid, fallbacks, and client-measured
+p50/p95 time to first text and full answer.
+
+Limitations to keep when reporting: 15 hand-written questions over a 5-article synthetic
+library, one run, one model. One changed answer moves accuracy by about 7 points, and p95
+of 15 samples is close to the maximum. Tool-selection "accuracy" checks that the expected
+tool was used, not that the answer was good; pair it with `grounding_eval.py` for
+citation support.

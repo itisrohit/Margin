@@ -19,6 +19,29 @@ type Source = {
   text: string
 }
 type TurnStatus = 'streaming' | 'done' | 'stopped' | 'error'
+type StepTool =
+  | 'search_article'
+  | 'search_library'
+  | 'search_notes'
+  | 'get_passage'
+  | 'propose_note'
+type Step = {
+  id: number
+  tool: StepTool | string
+  status: 'running' | 'done' | 'error'
+  query?: string
+  results?: number
+  paragraphIndex?: number
+  title?: string
+  detail?: string
+}
+type Proposal = {
+  id: string
+  paragraphIndex: number
+  sourceId?: number
+  text: string
+  status: 'pending' | 'approved' | 'rejected'
+}
 type Turn = {
   id: number
   question: string
@@ -30,6 +53,8 @@ type Turn = {
   followUps?: string[]
   quote?: string
   paragraphIndex?: number
+  steps?: Step[]
+  proposal?: Proposal
 }
 export type VoiceQuestion = { text: string; id: number; releasedAt: number }
 
@@ -78,6 +103,115 @@ const plainAnswer = (answer: string) =>
     .replace(/^#{1,6}\s+/gm, '')
     .trim()
 
+const plural = (n: number, one: string, many: string) =>
+  `${n} ${n === 1 ? one : many}`
+
+function stepLabel(step: Step): string {
+  const passage =
+    step.paragraphIndex === undefined ? '' : ` ${step.paragraphIndex + 1}`
+  const n = step.results ?? 0
+  const found = (one: string, many: string) =>
+    n ? plural(n, one, many) : 'nothing found'
+  if (step.status === 'error') {
+    const what: Record<string, string> = {
+      search_notes: 'search your notes',
+      search_library: 'search your library',
+      search_article: 'search this article',
+      get_passage: 'read that passage',
+      propose_note: 'draft that note',
+    }
+    return `Couldn’t ${what[step.tool] ?? 'look that up'}`
+  }
+  const running = step.status === 'running'
+  switch (step.tool) {
+    case 'search_notes':
+      return running
+        ? 'Searching your notes…'
+        : `Searched your notes · ${found('thought', 'thoughts')}`
+    case 'search_library':
+      return running
+        ? 'Searching your library…'
+        : `Searched your library · ${found('passage', 'passages')}`
+    case 'search_article':
+      return running
+        ? 'Searching this article…'
+        : `Searched this article · ${found('passage', 'passages')}`
+    case 'get_passage':
+      return running
+        ? 'Reading around a passage…'
+        : `Read around passage${passage}`
+    case 'propose_note':
+      return running
+        ? 'Drafting a note…'
+        : `Drafted a note for passage${passage}`
+    default:
+      return running ? 'Looking something up…' : 'Looked something up'
+  }
+}
+
+const STEP_NOUNS: Record<string, string> = {
+  search_notes: 'your notes',
+  search_library: 'your library',
+  search_article: 'this article',
+  get_passage: 'nearby passages',
+}
+
+function stepsSummary(steps: Step[]): string {
+  const nouns = [
+    ...new Set(steps.map((s) => STEP_NOUNS[s.tool]).filter(Boolean)),
+  ]
+  if (!nouns.length) return 'Drafted a note'
+  const list =
+    nouns.length === 1
+      ? nouns[0]
+      : `${nouns.slice(0, -1).join(', ')} and ${nouns[nouns.length - 1]}`
+  return `Checked ${list}`
+}
+
+function StepTimeline({ steps, live }: { steps: Step[]; live: boolean }) {
+  const [open, setOpen] = useState(false)
+  const expanded = live || open
+  return (
+    <div className={`companion-steps${expanded ? ' is-open' : ''}`}>
+      {!live && (
+        <button
+          type="button"
+          className="companion-steps-toggle"
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+        >
+          {stepsSummary(steps)}
+          <span aria-hidden="true">›</span>
+        </button>
+      )}
+      {expanded && (
+        <ol
+          className="companion-steps-list"
+          aria-live={live ? 'polite' : undefined}
+        >
+          {steps.map((step) => {
+            const state =
+              step.status === 'running' && !live ? 'error' : step.status
+            return (
+              <li key={step.id} className={`is-${state}`}>
+                <span className="companion-step-mark" aria-hidden="true" />
+                <span className="companion-step-text">
+                  {step.status === 'running' && !live
+                    ? 'Stopped before finishing'
+                    : stepLabel(step)}
+                  {step.query && (
+                    <span className="companion-step-query">“{step.query}”</span>
+                  )}
+                </span>
+              </li>
+            )
+          })}
+        </ol>
+      )}
+    </div>
+  )
+}
+
 const newChatId = () =>
   typeof crypto !== 'undefined' && 'randomUUID' in crypto
     ? crypto.randomUUID()
@@ -86,7 +220,9 @@ const newChatId = () =>
 // Changes whenever a chat has something new worth sending to the server.
 const chatSignature = (chat: Chat) => {
   const last = chat.turns[chat.turns.length - 1]
-  return `${chat.updatedAt}:${chat.turns.length}:${last?.answer.length ?? 0}:${last?.status ?? ''}:${last?.followUps?.length ?? 0}:${chat.summaryCovers ?? 0}`
+  const steps = chat.turns.reduce((n, t) => n + (t.steps?.length ?? 0), 0)
+  const proposals = chat.turns.map((t) => t.proposal?.status ?? '').join('')
+  return `${chat.updatedAt}:${chat.turns.length}:${last?.answer.length ?? 0}:${last?.status ?? ''}:${last?.followUps?.length ?? 0}:${chat.summaryCovers ?? 0}:${steps}:${proposals}`
 }
 
 function mergeChats(local: Chat[], remote: Chat[]): Chat[] {
@@ -103,6 +239,15 @@ function mergeChats(local: Chat[], remote: Chat[]): Chat[] {
 
 const MAX_HISTORY_TURNS = 16
 const CHATS_STORAGE_KEY = 'margin:companion-chats'
+const AGENT_STORAGE_KEY = 'margin:companion-agent'
+
+function readAgentMode(): boolean {
+  try {
+    return localStorage.getItem(AGENT_STORAGE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
 const MAX_CHATS_PER_ARTICLE = 30
 
 function readAllChats(): Record<string, Chat[]> {
@@ -171,6 +316,17 @@ function HistoryIcon() {
         strokeWidth="1.4"
         strokeLinecap="round"
         strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
+function AgentIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true">
+      <path
+        d="M8 1.5c.4 2.9 1.6 4.1 4.5 4.5-2.9.4-4.1 1.6-4.5 4.5C7.6 7.6 6.4 6.4 3.5 6 6.4 5.6 7.6 4.4 8 1.5Zm4.5 8c.2 1.4.8 2 2.2 2.2-1.4.2-2 .8-2.2 2.2-.2-1.4-.8-2-2.2-2.2 1.4-.2 2-.8 2.2-2.2Z"
+        fill="currentColor"
       />
     </svg>
   )
@@ -378,6 +534,16 @@ export function Companion({
 }) {
   const [question, setQuestion] = useState('')
   const [scope, setScope] = useState<'passage' | 'library'>('passage')
+  const [agentMode, setAgentMode] = useState(readAgentMode)
+  const toggleAgentMode = () =>
+    setAgentMode((value) => {
+      try {
+        localStorage.setItem(AGENT_STORAGE_KEY, value ? '0' : '1')
+      } catch {
+        // Storage unavailable: the choice lasts for this page only.
+      }
+      return !value
+    })
   const [chats, setChats] = useState<Chat[]>(() => loadChats(article.url))
   const [chatId, setChatId] = useState<string>(
     () => chats[0]?.id ?? newChatId(),
@@ -734,6 +900,7 @@ export function Companion({
             contextStart: start,
             context: article.paragraphs.slice(start, askIndex + 3),
             scope: activeScope,
+            agent: agentMode,
             summary,
             quote: attachedQuote,
             notes: readerNotes,
@@ -758,6 +925,22 @@ export function Companion({
             update((t) => ({ ...t, followUps: event.questions }))
           if (event.type === 'sources')
             update((t) => ({ ...t, sources: event.sources }))
+          if (event.type === 'step')
+            update((t) => {
+              const steps = t.steps ?? []
+              const known = steps.some((s) => s.id === event.id)
+              const { type: _type, ...fields } = event
+              return {
+                ...t,
+                steps: known
+                  ? steps.map((s) =>
+                      s.id === event.id ? { ...s, ...fields } : s,
+                    )
+                  : [...steps, fields as Step],
+              }
+            })
+          if (event.type === 'proposal')
+            update((t) => ({ ...t, proposal: event.proposal }))
           if (event.type === 'delta') {
             if (firstAt === null) firstAt = performance.now()
             update((t) => ({ ...t, answer: t.answer + event.text }))
@@ -808,7 +991,16 @@ export function Companion({
         if (controller.current === abort) setBusy(false)
       }
     },
-    [apiKey, apiUrl, article, clientId, paragraphIndex, scope, outline],
+    [
+      apiKey,
+      apiUrl,
+      article,
+      clientId,
+      paragraphIndex,
+      scope,
+      outline,
+      agentMode,
+    ],
   )
 
   useEffect(() => {
@@ -841,6 +1033,29 @@ export function Companion({
     window.setTimeout(
       () => setSavedTurnId((id) => (id === turn.id ? null : id)),
       2400,
+    )
+  }
+
+  // The agent only drafts notes; nothing is written until the reader approves.
+  const resolveProposal = (turn: Turn, approve: boolean) => {
+    const proposal = turn.proposal
+    if (!proposal || proposal.status !== 'pending') return
+    if (approve) {
+      if (!onSaveThought) return
+      onSaveThought(proposal.paragraphIndex, proposal.text)
+    }
+    setTurns((previous) =>
+      previous.map((t) =>
+        t.id === turn.id && t.proposal
+          ? {
+              ...t,
+              proposal: {
+                ...t.proposal,
+                status: approve ? 'approved' : 'rejected',
+              },
+            }
+          : t,
+      ),
     )
   }
 
@@ -1076,22 +1291,69 @@ export function Companion({
                   )}
                   <p className="companion-question">{turn.question}</p>
                 </div>
+                {!!turn.steps?.length && (
+                  <StepTimeline
+                    steps={turn.steps}
+                    live={turn.status === 'streaming'}
+                  />
+                )}
                 <div className="companion-answer">
                   {turn.answer ? (
                     renderAnswer(turn.answer, turn.sources, onNavigate)
-                  ) : turn.status === 'streaming' ? (
+                  ) : turn.status === 'streaming' &&
+                    !turn.steps?.some((s) => s.status === 'running') ? (
                     <p className="companion-thinking">
                       <span className="companion-dots" aria-hidden="true">
                         <span />
                         <span />
                         <span />
                       </span>
-                      {turn.sources.length
-                        ? `Reading ${turn.sources.length} passages…`
-                        : 'Finding the evidence…'}
+                      {turn.steps?.length
+                        ? 'Thinking it through…'
+                        : turn.sources.length
+                          ? `Reading ${turn.sources.length} passages…`
+                          : 'Finding the evidence…'}
                     </p>
                   ) : null}
                 </div>
+
+                {turn.proposal && (
+                  <div
+                    className={`companion-proposal is-${turn.proposal.status}`}
+                  >
+                    <p className="companion-proposal-label">
+                      Suggested note · passage{' '}
+                      {turn.proposal.paragraphIndex + 1}
+                    </p>
+                    <p className="companion-proposal-text">
+                      {turn.proposal.text}
+                    </p>
+                    {turn.proposal.status === 'pending' ? (
+                      <div className="companion-proposal-actions">
+                        <button
+                          type="button"
+                          className="is-primary"
+                          onClick={() => resolveProposal(turn, true)}
+                          disabled={!onSaveThought}
+                        >
+                          Approve
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => resolveProposal(turn, false)}
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    ) : (
+                      <p className="companion-proposal-status">
+                        {turn.proposal.status === 'approved'
+                          ? `Saved to passage ${turn.proposal.paragraphIndex + 1} ✓`
+                          : 'Not saved'}
+                      </p>
+                    )}
+                  </div>
+                )}
 
                 {(turn.status === 'stopped' || turn.status === 'error') && (
                   <div
@@ -1298,26 +1560,42 @@ export function Companion({
             }}
           />
           <div className="companion-input-bar">
-            <div
-              className="companion-scope"
-              role="group"
-              aria-label="Answer from"
-            >
+            <div className="companion-modes">
+              <div
+                className="companion-scope"
+                role="group"
+                aria-label="Answer from"
+              >
+                <button
+                  type="button"
+                  aria-pressed={scope === 'passage'}
+                  onClick={() => setScope('passage')}
+                  title="Answer from this passage and its surroundings"
+                >
+                  Passage
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={scope === 'library'}
+                  onClick={() => setScope('library')}
+                  title="Answer from everything you've saved"
+                >
+                  Library
+                </button>
+              </div>
               <button
                 type="button"
-                aria-pressed={scope === 'passage'}
-                onClick={() => setScope('passage')}
-                title="Answer from this passage and its surroundings"
+                className="companion-agent-toggle"
+                aria-pressed={agentMode}
+                onClick={toggleAgentMode}
+                title={
+                  agentMode
+                    ? 'Agent mode is on: Margin decides what to look up in your notes, library and this article. Click to turn off.'
+                    : 'Agent mode: let Margin decide what to look up in your notes, library and this article. Can take a little longer.'
+                }
               >
-                Passage
-              </button>
-              <button
-                type="button"
-                aria-pressed={scope === 'library'}
-                onClick={() => setScope('library')}
-                title="Answer from everything you've saved"
-              >
-                Library
+                <AgentIcon />
+                Agent
               </button>
             </div>
             {voice && (

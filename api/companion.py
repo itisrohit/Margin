@@ -6,7 +6,8 @@ import json
 import os
 import re
 from collections import OrderedDict
-from collections.abc import Callable, Hashable
+from collections.abc import AsyncIterator, Callable, Hashable
+from datetime import datetime
 from time import perf_counter
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -102,6 +103,8 @@ class Question(Input):
     context: list[str] = Field(min_length=1, max_length=9)
     context_start: int = Field(alias="contextStart", ge=0)
     scope: Literal["passage", "library"] = "passage"
+    # Agent mode for this request; None means the server default (MARGIN_AGENT).
+    agent: bool | None = None
     history: list[Turn] = Field(default_factory=list, max_length=32)
     earlier_questions: list[Annotated[str, Field(max_length=300)]] = Field(
         default_factory=list, alias="earlierQuestions", max_length=30
@@ -332,15 +335,35 @@ def fuse(
     return picked
 
 
-def search(owner: UUID, vector: list[float], question: str = "") -> list[dict]:
-    """Hybrid retrieval across the reader's library: meaning plus exact words."""
+def search(
+    owner: UUID,
+    vector: list[float],
+    question: str = "",
+    *,
+    article_url: str | None = None,
+    passages: bool = True,
+    thoughts: bool = True,
+    since: datetime | None = None,
+    max_passages: int = MAX_PASSAGES,
+    per_article: int = MAX_PER_ARTICLE,
+    max_thoughts: int = MAX_THOUGHTS,
+    thoughts_per_article: int = 2,
+) -> list[dict]:
+    """Hybrid retrieval over the reader's own data: meaning plus exact words.
+
+    Always scoped to `owner`; optionally to one article, and (for thoughts) to notes
+    written since a given time.
+    """
     terms = keyword_query(question)
     with Session(engine) as session:
 
-        def ranked(model, content, limit: int) -> list[list[Any]]:
+        def ranked(model, content, limit: int, *filters: Any) -> list[list[Any]]:
+            scope = [model.client_id == owner, *filters]
+            if article_url is not None:
+                scope.append(model.article_url == article_url)
             by_meaning = session.scalars(
                 select(model)
-                .where(model.client_id == owner)
+                .where(*scope)
                 .order_by(model.embedding.cosine_distance(vector))
                 .limit(limit)
             ).all()
@@ -350,25 +373,38 @@ def search(owner: UUID, vector: list[float], question: str = "") -> list[dict]:
             query = func.to_tsquery("english", terms)
             by_words = session.scalars(
                 select(model)
-                .where(model.client_id == owner, document.op("@@")(query))
+                .where(*scope, document.op("@@")(query))
                 .order_by(func.ts_rank_cd(document, query).desc())
                 .limit(limit)
             ).all()
             return [list(by_meaning), list(by_words)]
 
-        passages = fuse(
-            ranked(Passage, Passage.content, CANDIDATES),
-            key=lambda row: (row.article_url, row.position, row.fragment),
-            group=lambda row: row.article_url,
-            limit=MAX_PASSAGES,
-            per_group=MAX_PER_ARTICLE,
+        found_passages = (
+            fuse(
+                ranked(Passage, Passage.content, CANDIDATES),
+                key=lambda row: (row.article_url, row.position, row.fragment),
+                group=lambda row: row.article_url,
+                limit=max_passages,
+                per_group=per_article,
+            )
+            if passages
+            else []
         )
-        thoughts = fuse(
-            ranked(ThoughtRecord, ThoughtRecord.note, CANDIDATES // 2),
-            key=lambda row: row.id,
-            group=lambda row: row.article_url,
-            limit=MAX_THOUGHTS,
-            per_group=2,
+        found_thoughts = (
+            fuse(
+                ranked(
+                    ThoughtRecord,
+                    ThoughtRecord.note,
+                    CANDIDATES // 2,
+                    *([ThoughtRecord.created_at >= since] if since else []),
+                ),
+                key=lambda row: row.id,
+                group=lambda row: row.article_url,
+                limit=max_thoughts,
+                per_group=thoughts_per_article,
+            )
+            if thoughts
+            else []
         )
         sources = [
             {
@@ -379,7 +415,7 @@ def search(owner: UUID, vector: list[float], question: str = "") -> list[dict]:
                 "paragraphIndex": row.position,
                 "text": row.content,
             }
-            for row in passages
+            for row in found_passages
         ]
         sources.extend(
             {
@@ -390,7 +426,7 @@ def search(owner: UUID, vector: list[float], question: str = "") -> list[dict]:
                 "paragraphIndex": row.paragraph_index,
                 "text": row.note,
             }
-            for row in thoughts
+            for row in found_thoughts
         )
         return sources
 
@@ -576,6 +612,219 @@ def event(kind: str, **values: object) -> str:
     return json.dumps({"type": kind, **values}) + "\n"
 
 
+CITATION = re.compile(r"\s?\[(\d+)\]")
+
+
+class CitationGuard:
+    """Streams answer text, dropping citations to numbers the model was never shown."""
+
+    def __init__(self, valid: set[int]) -> None:
+        self.valid = valid
+        self.buffer = ""
+        self.stripped = 0
+
+    def clean(self, text_value: str) -> str:
+        def keep(match: re.Match[str]) -> str:
+            if int(match.group(1)) in self.valid:
+                return match.group(0)
+            self.stripped += 1
+            return ""
+
+        return CITATION.sub(keep, text_value)
+
+    def feed(self, text_value: str) -> str:
+        self.buffer += text_value
+        cut = len(self.buffer)
+        opened = self.buffer.rfind("[")
+        # Hold back a citation that may still be arriving, like "[1" before "2]".
+        if opened >= 0 and "]" not in self.buffer[opened:] and cut - opened <= 8:
+            cut = opened
+            if opened > 0 and self.buffer[opened - 1].isspace():
+                cut -= 1
+        ready, self.buffer = self.buffer[:cut], self.buffer[cut:]
+        return self.clean(ready)
+
+    def finish(self) -> str:
+        rest, self.buffer = self.buffer, ""
+        return self.clean(rest)
+
+
+class AnswerStream:
+    """Visible answer text: hides the follow-up block and guards citations."""
+
+    def __init__(self, valid: set[int]) -> None:
+        self.splitter = FollowUpSplitter()
+        self.guard = CitationGuard(valid)
+
+    def feed(self, text_value: str) -> str:
+        visible = self.splitter.feed(text_value)
+        return self.guard.feed(visible) if visible else ""
+
+    def finish(self) -> tuple[str, list[str]]:
+        rest, follow_ups = self.splitter.finish()
+        return self.guard.feed(rest) + self.guard.finish(), follow_ups
+
+
+EVIDENCE_BUDGET = 30_000
+
+
+def number_sources(sources: list[dict[str, Any]], budget: int = EVIDENCE_BUDGET) -> list[dict]:
+    """Deduplicate anchors, keep a bounded evidence budget, and assign citation ids."""
+    unique: dict[tuple, dict[str, Any]] = {}
+    for source in sources:
+        anchor = (source["kind"], source["url"], source["paragraphIndex"])
+        # Keep the selected passage context instead of overwriting it with
+        # a retrieved fragment of the same paragraph.
+        unique.setdefault(anchor, source)
+    numbered: list[dict[str, Any]] = []
+    remaining = budget
+    for source in unique.values():
+        if remaining <= 0:
+            break
+        content = source["text"][: min(4000, remaining)]
+        numbered.append(dict(source, text=content, id=len(numbered) + 1))
+        remaining -= len(content)
+    return numbered
+
+
+async def gather_sources(
+    question: Question, key: str, timing: dict[str, object]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """The evidence every answer starts from: the passage window, the reader's notes on
+    this article and, in library scope, a hybrid search of the whole library."""
+    sources: list[dict[str, Any]] = [
+        {
+            "kind": "article",
+            "title": question.title,
+            "url": question.article_url,
+            "paragraphIndex": question.context_start + index,
+            "text": content[:4000],
+        }
+        for index, content in enumerate(question.context)
+    ]
+    library: list[str] = []
+    if question.scope == "library":
+        await run_in_threadpool(ensure_schema)
+        tick = perf_counter()
+        retrieval_question = question.question
+        if question.history:
+            prior_questions = [t.content for t in question.history if t.role == "user"]
+            retrieval_question = "\n".join(prior_questions[-1:] + [question.question])
+        vector, hit = await query_vector(retrieval_question, key, question.client_id)
+        timing["embeddingMs"] = round((perf_counter() - tick) * 1000, 1)
+        timing["queryCacheHit"] = hit
+        tick = perf_counter()
+        await run_in_threadpool(ensure_search_index)
+        found, titles = await asyncio.gather(
+            run_in_threadpool(search, question.client_id, vector, retrieval_question),
+            run_in_threadpool(library_titles, question.client_id),
+        )
+        sources.extend(found)
+        library = titles
+        timing["libraryArticles"] = len(titles)
+        timing["retrievedArticles"] = len({s["url"] for s in found if s["kind"] == "article"})
+        timing["searchMs"] = round((perf_counter() - tick) * 1000, 1)
+    # The reader's own notes on this article are first-class context.
+    sources.extend(
+        {
+            "kind": "thought",
+            "title": question.title,
+            "url": question.article_url,
+            "paragraphIndex": note.paragraph_index,
+            "text": note.text,
+        }
+        for note in sorted(
+            question.notes,
+            key=lambda note: abs(note.paragraph_index - question.paragraph_index),
+        )
+    )
+    return number_sources(sources), library
+
+
+def base_messages(question: Question, system: str = "") -> list[dict[str, Any]]:
+    history, earlier = fit_history(question.history, question.earlier_questions)
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT + system + recap(earlier, question.summary),
+        }
+    ]
+    messages.extend(turn.model_dump() for turn in history)
+    return messages
+
+
+COMPANION_ERROR = "The companion could not finish. Check your key or try again."
+
+
+async def single_pass(
+    question: Question,
+    key: str,
+    request: Request,
+    started: float,
+    timing: dict[str, object],
+    sources: list[dict[str, Any]] | None = None,
+    library: list[str] | None = None,
+) -> AsyncIterator[str]:
+    """One retrieval, one streamed answer. Also the agent's fallback path."""
+    try:
+        if sources is None:
+            sources, library = await gather_sources(question, key, timing)
+        yield event("sources", sources=sources)
+        messages = base_messages(question)
+        timing["historyTurns"] = (len(messages) - 1) // 2
+        messages.append({"role": "user", "content": build_prompt(question, sources, library)})
+        first = True
+        answer = AnswerStream({source["id"] for source in sources})
+        tick = perf_counter()
+        async with (await client()).stream(
+            "POST",
+            f"{BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": MODEL,
+                "messages": messages,
+                "stream": True,
+                "temperature": 0.5,
+                "max_tokens": 900,
+            },
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if await request.is_disconnected():
+                    return
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                data = json.loads(line[6:])
+                choices = data.get("choices", [])
+                content = choices[0].get("delta", {}).get("content") if choices else None
+                if content:
+                    if first:
+                        timing["modelTtftMs"] = round((perf_counter() - tick) * 1000, 1)
+                        timing.setdefault(
+                            "firstAnswerMs", round((perf_counter() - started) * 1000, 1)
+                        )
+                        first = False
+                    visible = answer.feed(content)
+                    if visible:
+                        yield event("delta", text=visible)
+        if first:
+            raise ValueError("Empty model answer")
+        rest, follow_ups = answer.finish()
+        if rest:
+            yield event("delta", text=rest)
+        if follow_ups:
+            yield event("followups", questions=follow_ups)
+        timing["strippedCitations"] = answer.guard.stripped
+        timing["totalMs"] = round((perf_counter() - started) * 1000, 1)
+        yield event("done", metrics=timing)
+    except (httpx.HTTPError, KeyError, ValueError, HTTPException, SQLAlchemyError):
+        yield event("error", detail=COMPANION_ERROR)
+
+
+def agent_enabled() -> bool:
+    return os.getenv("MARGIN_AGENT", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @router.post("/ask")
 async def ask(
     question: Question, request: Request, authorization: str | None = Header(default=None)
@@ -587,123 +836,14 @@ async def ask(
     async def stream():
         started = perf_counter()
         timing: dict[str, object] = {"model": MODEL, "scope": question.scope}
-        sources = [
-            {
-                "kind": "article",
-                "title": question.title,
-                "url": question.article_url,
-                "paragraphIndex": question.context_start + index,
-                "text": content[:4000],
-            }
-            for index, content in enumerate(question.context)
-        ]
-        library: list[str] = []
-        try:
-            if question.scope == "library":
-                await run_in_threadpool(ensure_schema)
-                tick = perf_counter()
-                retrieval_question = question.question
-                if question.history:
-                    prior_questions = [t.content for t in question.history if t.role == "user"]
-                    retrieval_question = "\n".join(prior_questions[-1:] + [question.question])
-                vector, hit = await query_vector(retrieval_question, key, question.client_id)
-                timing["embeddingMs"] = round((perf_counter() - tick) * 1000, 1)
-                timing["queryCacheHit"] = hit
-                tick = perf_counter()
-                await run_in_threadpool(ensure_search_index)
-                found, titles = await asyncio.gather(
-                    run_in_threadpool(search, question.client_id, vector, retrieval_question),
-                    run_in_threadpool(library_titles, question.client_id),
-                )
-                sources.extend(found)
-                library = titles
-                timing["libraryArticles"] = len(titles)
-                timing["retrievedArticles"] = len(
-                    {s["url"] for s in found if s["kind"] == "article"}
-                )
-                timing["searchMs"] = round((perf_counter() - tick) * 1000, 1)
-            # The reader's own notes on this article are first-class context.
-            sources.extend(
-                {
-                    "kind": "thought",
-                    "title": question.title,
-                    "url": question.article_url,
-                    "paragraphIndex": note.paragraph_index,
-                    "text": note.text,
-                }
-                for note in sorted(
-                    question.notes,
-                    key=lambda note: abs(note.paragraph_index - question.paragraph_index),
-                )
-            )
-            # Deduplicate anchors and keep a bounded evidence budget.
-            unique: dict[tuple, dict[str, Any]] = {}
-            for source in sources:
-                anchor = (source["kind"], source["url"], source["paragraphIndex"])
-                # Keep the selected passage context instead of overwriting it with
-                # a retrieved fragment of the same paragraph.
-                unique.setdefault(anchor, source)
-            sources = []
-            remaining = 30000
-            for source in unique.values():
-                if remaining <= 0:
-                    break
-                content = source["text"][: min(4000, remaining)]
-                sources.append(dict(source, text=content, id=len(sources) + 1))
-                remaining -= len(content)
-            yield event("sources", sources=sources)
-            history, earlier = fit_history(question.history, question.earlier_questions)
-            timing["historyTurns"] = len(history) // 2
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT + recap(earlier, question.summary)}
-            ]
-            messages.extend(turn.model_dump() for turn in history)
-            messages.append({"role": "user", "content": build_prompt(question, sources, library)})
-            first = True
-            splitter = FollowUpSplitter()
-            tick = perf_counter()
-            async with (await client()).stream(
-                "POST",
-                f"{BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                json={
-                    "model": MODEL,
-                    "messages": messages,
-                    "stream": True,
-                    "temperature": 0.5,
-                    "max_tokens": 900,
-                },
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if await request.is_disconnected():
-                        return
-                    if not line.startswith("data: ") or line == "data: [DONE]":
-                        continue
-                    data = json.loads(line[6:])
-                    choices = data.get("choices", [])
-                    content = choices[0].get("delta", {}).get("content") if choices else None
-                    if content:
-                        if first:
-                            timing["modelTtftMs"] = round((perf_counter() - tick) * 1000, 1)
-                            timing["firstAnswerMs"] = round((perf_counter() - started) * 1000, 1)
-                            first = False
-                        visible = splitter.feed(content)
-                        if visible:
-                            yield event("delta", text=visible)
-            if first:
-                raise ValueError("Empty model answer")
-            rest, follow_ups = splitter.finish()
-            if rest:
-                yield event("delta", text=rest)
-            if follow_ups:
-                yield event("followups", questions=follow_ups)
-            timing["totalMs"] = round((perf_counter() - started) * 1000, 1)
-            yield event("done", metrics=timing)
-        except (httpx.HTTPError, KeyError, ValueError, HTTPException, SQLAlchemyError):
-            yield event(
-                "error", detail="The companion could not finish. Check your key or try again."
-            )
+        if agent_enabled() if question.agent is None else question.agent:
+            from agent import run_agent  # local import: agent builds on this module
+
+            async for line in run_agent(question, key, request, started, timing):
+                yield line
+            return
+        async for line in single_pass(question, key, request, started, timing):
+            yield line
 
     return StreamingResponse(
         stream(),

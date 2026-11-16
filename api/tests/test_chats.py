@@ -166,3 +166,50 @@ class ChatSummaryPersistenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(chat["turns"][0]["followUps"], ["Next?"])
             self.assertEqual(chat["turns"][0]["paragraphIndex"], 3)
             await client.delete("/companion/chats/with-summary", params={"clientId": client_id})
+
+    async def test_agent_steps_and_proposal_round_trip(self):
+        app = FastAPI()
+        app.include_router(chats.router)
+        client_id = str(uuid4())
+        turn = {
+            "id": 1,
+            "question": "What did I note about focus?",
+            "answer": "You noted [1].",
+            "status": "streaming",
+            "steps": [
+                {"id": 1, "tool": "search_notes", "query": "focus", "status": "done", "results": 2},
+                {"id": 2, "tool": "get_passage", "status": "running"},
+            ],
+            "proposal": {
+                "id": "abc123",
+                "paragraphIndex": 4,
+                "sourceId": 1,
+                "text": "Focus is a budget.",
+                "status": "pending",
+            },
+        }
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://margin.test"
+        ) as client:
+            saved = await client.put(
+                "/companion/chats/with-steps",
+                json={
+                    "clientId": client_id,
+                    "articleUrl": "https://example.com",
+                    "title": "Q",
+                    "turns": [turn],
+                    "updatedAt": "2026-11-16T10:00:00Z",
+                },
+            )
+            self.assertEqual(saved.status_code, 200)
+            listed = await client.get(
+                "/companion/chats",
+                params={"clientId": client_id, "articleUrl": "https://example.com"},
+            )
+            [stored] = listed.json()["chats"][0]["turns"]
+            await client.delete("/companion/chats/with-steps", params={"clientId": client_id})
+        self.assertEqual(stored["steps"][0]["results"], 2)
+        # A lookup still running when saved never finished.
+        self.assertEqual(stored["steps"][1]["status"], "error")
+        self.assertEqual(stored["proposal"]["status"], "pending")
+        self.assertEqual(stored["proposal"]["paragraphIndex"], 4)
