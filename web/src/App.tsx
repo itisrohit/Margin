@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const NOTES_STORAGE_KEY = 'margin:sample-essay:notes'
@@ -8,14 +8,14 @@ const speechModels = [
   {
     id: 'cache-aware-parakeet-rnnt-en-US-asr-streaming-sortformer',
     name: 'Nemotron ASR',
-    detail: 'English · Live streaming',
-    mode: 'Shows transcription while you speak.',
+    detail: 'English · Streaming model',
+    mode: 'Words appear as you speak.',
   },
   {
     id: 'parakeet-rnnt-1.1b-unified-ml-cs-universal-multi-asr-streaming-silero-vad-sortformer',
     name: 'Parakeet RNNT 1.1B',
-    detail: '25 languages · Live streaming',
-    mode: 'Shows transcription while you speak.',
+    detail: '25 languages · Streaming model',
+    mode: 'Words appear as you speak.',
   },
   {
     id: 'parakeet-rnnt-1.1b-unified-ml-cs-universal-multi-asr-offline-silero-vad-sortformer',
@@ -39,7 +39,89 @@ const speechModels = [
 
 type SpeechModelId = (typeof speechModels)[number]['id']
 type SpeechSettings = { apiKey: string; modelId: SpeechModelId }
+type LiveCapture = {
+  socket: WebSocket
+  stream: MediaStream
+  context: AudioContext
+  source: MediaStreamAudioSourceNode
+  processor: ScriptProcessorNode
+  mute: GainNode
+  paragraphIndex: number
+  latestText: string
+}
 const DEFAULT_SPEECH_MODEL_ID: SpeechModelId = speechModels[0].id
+const API_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
+const AUDIO_SAMPLE_RATE = 16_000
+
+async function convertRecordingToWav(recording: Blob): Promise<ArrayBuffer> {
+  const decoder = new AudioContext()
+  try {
+    const decoded = await decoder.decodeAudioData(await recording.arrayBuffer())
+    const frameCount = Math.ceil(decoded.duration * AUDIO_SAMPLE_RATE)
+    const renderer = new OfflineAudioContext(1, frameCount, AUDIO_SAMPLE_RATE)
+    const source = renderer.createBufferSource()
+    source.buffer = decoded
+    source.connect(renderer.destination)
+    source.start()
+    const resampled = await renderer.startRendering()
+    const samples = resampled.getChannelData(0)
+    const wav = new ArrayBuffer(44 + samples.length * 2)
+    const view = new DataView(wav)
+
+    const writeString = (offset: number, value: string) => {
+      for (let index = 0; index < value.length; index += 1) {
+        view.setUint8(offset + index, value.charCodeAt(index))
+      }
+    }
+
+    writeString(0, 'RIFF')
+    view.setUint32(4, wav.byteLength - 8, true)
+    writeString(8, 'WAVE')
+    writeString(12, 'fmt ')
+    view.setUint32(16, 16, true)
+    view.setUint16(20, 1, true)
+    view.setUint16(22, 1, true)
+    view.setUint32(24, AUDIO_SAMPLE_RATE, true)
+    view.setUint32(28, AUDIO_SAMPLE_RATE * 2, true)
+    view.setUint16(32, 2, true)
+    view.setUint16(34, 16, true)
+    writeString(36, 'data')
+    view.setUint32(40, samples.length * 2, true)
+
+    for (let index = 0; index < samples.length; index += 1) {
+      const sample = Math.max(-1, Math.min(1, samples[index]))
+      view.setInt16(
+        44 + index * 2,
+        sample < 0 ? sample * 0x8000 : sample * 0x7fff,
+        true,
+      )
+    }
+
+    return wav
+  } finally {
+    await decoder.close()
+  }
+}
+
+function capitalizeSentenceStart(text: string): string {
+  return text.replace(
+    /^(\s*["'“‘([{]*)(\p{L})/u,
+    (_, prefix, letter: string) => `${prefix}${letter.toUpperCase()}`,
+  )
+}
+
+function appendTranscript(existingText: string, transcript: string): string {
+  const existing = existingText.trimEnd()
+  const incoming = transcript.trim().replace(/\s+/g, ' ')
+  if (!existing) return capitalizeSentenceStart(incoming)
+  if (!incoming) return existing
+
+  const hasSentenceEnd = /[.!?…]["'’”)}\]]*$/u.test(existing)
+  const continuesSameSentence = /[,;:—–-]["'’”)}\]]*$/u.test(existing)
+  if (hasSentenceEnd) return `${existing} ${capitalizeSentenceStart(incoming)}`
+  if (continuesSameSentence) return `${existing} ${incoming}`
+  return `${existing}. ${capitalizeSentenceStart(incoming)}`
+}
 
 function loadSpeechSettings(): SpeechSettings {
   try {
@@ -117,7 +199,8 @@ function App() {
   const [isEditingNote, setIsEditingNote] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
   const [storageWarning, setStorageWarning] = useState(false)
-  const [speechSettings, setSpeechSettings] = useState<SpeechSettings>(loadSpeechSettings)
+  const [speechSettings, setSpeechSettings] =
+    useState<SpeechSettings>(loadSpeechSettings)
   const [settingsDraft, setSettingsDraft] = useState<SpeechSettings>({
     apiKey: '',
     modelId: DEFAULT_SPEECH_MODEL_ID,
@@ -125,6 +208,15 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
   const [settingsSaved, setSettingsSaved] = useState(false)
   const [settingsStorageError, setSettingsStorageError] = useState(false)
+  const [voiceState, setVoiceState] = useState<
+    'idle' | 'recording' | 'transcribing' | 'error'
+  >('idle')
+  const [isLivePreview, setIsLivePreview] = useState(false)
+  const [voiceError, setVoiceError] = useState('')
+  const recorderRef = useRef<MediaRecorder | null>(null)
+  const liveCaptureRef = useRef<LiveCapture | null>(null)
+  const voiceHoldRef = useRef(false)
+  const holdSourceRef = useRef<'keyboard' | 'pointer' | null>(null)
 
   const focusedParagraphIndex = activeParagraphIndex
   const focusedParagraph =
@@ -132,7 +224,7 @@ function App() {
   const activeNote =
     activeParagraphIndex === null ? undefined : notes[activeParagraphIndex]
 
-  const persistNotes = (updatedNotes: Record<number, string>) => {
+  const persistNotes = useCallback((updatedNotes: Record<number, string>) => {
     setNotes(updatedNotes)
     try {
       window.localStorage.setItem(
@@ -143,7 +235,7 @@ function App() {
     } catch {
       setStorageWarning(true)
     }
-  }
+  }, [])
 
   const selectParagraph = (index: number) => {
     setActiveParagraphIndex(index)
@@ -151,6 +243,308 @@ function App() {
     setIsEditingNote(false)
     setConfirmingDelete(false)
   }
+
+  const startVoiceCapture = useCallback(async () => {
+    if (recorderRef.current || !voiceHoldRef.current) return
+    if (activeParagraphIndex === null) {
+      setVoiceError('Select a passage before recording a thought.')
+      setVoiceState('error')
+      voiceHoldRef.current = false
+      return
+    }
+    if (!speechSettings.apiKey) {
+      setSettingsDraft(speechSettings)
+      setIsSettingsOpen(true)
+      voiceHoldRef.current = false
+      return
+    }
+
+    const paragraphIndex = activeParagraphIndex
+    let stream: MediaStream | null = null
+    try {
+      if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+        throw new Error('This browser does not support microphone recording.')
+      }
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1 },
+      })
+      if (!voiceHoldRef.current) {
+        stream.getTracks().forEach((track) => track.stop())
+        return
+      }
+
+      const model = speechModels.find(
+        (candidate) => candidate.id === speechSettings.modelId,
+      )
+      if (model?.detail.includes('Streaming')) {
+        const websocketUrl = new URL(API_URL)
+        websocketUrl.protocol =
+          websocketUrl.protocol === 'https:' ? 'wss:' : 'ws:'
+        websocketUrl.pathname = '/speech/stream'
+        const socket = new WebSocket(websocketUrl)
+        socket.binaryType = 'arraybuffer'
+        await new Promise<void>((resolve, reject) => {
+          socket.onopen = () => resolve()
+          socket.onerror = () =>
+            reject(new Error('Could not connect to transcription.'))
+        })
+        if (!voiceHoldRef.current) {
+          socket.close()
+          stream.getTracks().forEach((track) => track.stop())
+          return
+        }
+
+        const context = new AudioContext()
+        await context.resume()
+        if (!voiceHoldRef.current) {
+          socket.close()
+          void context.close()
+          stream.getTracks().forEach((track) => track.stop())
+          return
+        }
+        const source = context.createMediaStreamSource(stream)
+        const processor = context.createScriptProcessor(4096, 1, 1)
+        const mute = context.createGain()
+        mute.gain.value = 0
+        const capture: LiveCapture = {
+          socket,
+          stream,
+          context,
+          source,
+          processor,
+          mute,
+          paragraphIndex,
+          latestText: '',
+        }
+        liveCaptureRef.current = capture
+        socket.onmessage = (event: MessageEvent<string>) => {
+          const result = JSON.parse(event.data) as {
+            type: 'transcript' | 'done' | 'error'
+            text?: string
+            detail?: string
+          }
+          if (result.type === 'transcript' && result.text) {
+            capture.latestText = result.text
+            setNoteDraft(
+              appendTranscript(notes[paragraphIndex] ?? '', result.text),
+            )
+          } else if (result.type === 'done') {
+            const transcript = (result.text || capture.latestText).trim()
+            if (transcript) {
+              const updatedNote = appendTranscript(
+                notes[paragraphIndex] ?? '',
+                transcript,
+              )
+              persistNotes({ ...notes, [paragraphIndex]: updatedNote })
+              setNoteDraft(updatedNote)
+              setVoiceError('')
+            } else {
+              setVoiceError(
+                'No speech was detected. Try speaking a little longer.',
+              )
+              setVoiceState('error')
+              setIsLivePreview(false)
+              liveCaptureRef.current = null
+              socket.close()
+              void context.close()
+              capture.stream.getTracks().forEach((track) => track.stop())
+              return
+            }
+            setVoiceState('idle')
+            setIsLivePreview(false)
+            liveCaptureRef.current = null
+            socket.close()
+            void context.close()
+            capture.stream.getTracks().forEach((track) => track.stop())
+          } else if (result.type === 'error') {
+            setVoiceError(result.detail ?? 'Transcription failed.')
+            setVoiceState('error')
+            setIsLivePreview(false)
+            liveCaptureRef.current = null
+            socket.close()
+            void context.close()
+            capture.stream.getTracks().forEach((track) => track.stop())
+          }
+        }
+        socket.onclose = () => {
+          if (liveCaptureRef.current === capture) {
+            setVoiceError('The live transcription connection closed.')
+            setVoiceState('error')
+            setIsLivePreview(false)
+            liveCaptureRef.current = null
+            void context.close()
+            capture.stream.getTracks().forEach((track) => track.stop())
+          }
+        }
+        socket.send(
+          JSON.stringify({
+            apiKey: speechSettings.apiKey,
+            modelId: speechSettings.modelId,
+          }),
+        )
+        processor.onaudioprocess = (event) => {
+          if (socket.readyState !== WebSocket.OPEN) return
+          const input = event.inputBuffer.getChannelData(0)
+          const ratio = context.sampleRate / AUDIO_SAMPLE_RATE
+          const outputLength = Math.floor(input.length / ratio)
+          const pcm = new Int16Array(outputLength)
+          for (let index = 0; index < outputLength; index += 1) {
+            const sample = input[Math.floor(index * ratio)]
+            const bounded = Math.max(-1, Math.min(1, sample))
+            pcm[index] = bounded < 0 ? bounded * 0x8000 : bounded * 0x7fff
+          }
+          socket.send(pcm.buffer)
+        }
+        source.connect(processor)
+        processor.connect(mute)
+        mute.connect(context.destination)
+        setVoiceError('')
+        setIsLivePreview(true)
+        setVoiceState('recording')
+        return
+      }
+
+      const preferredType = [
+        'audio/webm;codecs=opus',
+        'audio/ogg;codecs=opus',
+        'audio/mp4',
+      ].find((type) => MediaRecorder.isTypeSupported(type))
+      const recorder = new MediaRecorder(
+        stream,
+        preferredType ? { mimeType: preferredType } : undefined,
+      )
+      const chunks: Blob[] = []
+      recorder.ondataavailable = (event) => {
+        if (event.data.size) chunks.push(event.data)
+      }
+      recorder.onstop = () => {
+        stream?.getTracks().forEach((track) => track.stop())
+        void (async () => {
+          setVoiceState('transcribing')
+          try {
+            const wav = await convertRecordingToWav(
+              new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }),
+            )
+            const response = await fetch(`${API_URL}/speech/transcribe`, {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${speechSettings.apiKey}`,
+                'Content-Type': 'audio/wav',
+                'X-Speech-Model': speechSettings.modelId,
+              },
+              body: wav,
+            })
+            const result: { text?: string; detail?: string } =
+              await response.json()
+            if (!response.ok)
+              throw new Error(result.detail ?? 'Transcription failed.')
+            const transcript = result.text?.trim()
+            if (!transcript)
+              throw new Error(
+                'No speech was detected. Try speaking a little longer.',
+              )
+
+            const existingNote = notes[paragraphIndex] ?? ''
+            const updatedNote = appendTranscript(existingNote, transcript)
+            persistNotes({ ...notes, [paragraphIndex]: updatedNote })
+            setNoteDraft(updatedNote)
+            setVoiceError('')
+            setVoiceState('idle')
+          } catch (error) {
+            setVoiceError(
+              error instanceof Error ? error.message : 'Transcription failed.',
+            )
+            setVoiceState('error')
+          } finally {
+            recorderRef.current = null
+          }
+        })()
+      }
+      recorder.onerror = () => {
+        stream?.getTracks().forEach((track) => track.stop())
+        recorderRef.current = null
+        setVoiceError('The microphone recording stopped unexpectedly.')
+        setVoiceState('error')
+      }
+
+      recorderRef.current = recorder
+      recorder.start()
+      setVoiceError('')
+      setVoiceState('recording')
+    } catch (error) {
+      stream?.getTracks().forEach((track) => track.stop())
+      voiceHoldRef.current = false
+      setVoiceError(
+        error instanceof Error && error.message.includes('does not support')
+          ? error.message
+          : 'Allow microphone access to record a thought.',
+      )
+      setVoiceState('error')
+    }
+  }, [activeParagraphIndex, notes, persistNotes, speechSettings])
+
+  const stopVoiceCapture = useCallback(() => {
+    voiceHoldRef.current = false
+    const liveCapture = liveCaptureRef.current
+    if (liveCapture) {
+      setVoiceState('transcribing')
+      liveCapture.source.disconnect()
+      liveCapture.processor.disconnect()
+      liveCapture.mute.disconnect()
+      liveCapture.stream.getTracks().forEach((track) => track.stop())
+      if (liveCapture.socket.readyState === WebSocket.OPEN) {
+        liveCapture.socket.send('stop')
+      }
+      void liveCapture.context.close()
+      return
+    }
+    const recorder = recorderRef.current
+    if (recorder && recorder.state !== 'inactive') recorder.stop()
+  }, [])
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.code !== 'Space') return
+      const target = event.target
+      if (
+        target instanceof HTMLElement &&
+        target.closest(
+          'input, textarea, select, [contenteditable="true"], button:not(.voice-capture)',
+        )
+      )
+        return
+      event.preventDefault()
+      if (
+        event.repeat ||
+        isEditingNote ||
+        isSettingsOpen ||
+        voiceState === 'recording' ||
+        voiceState === 'transcribing'
+      )
+        return
+      voiceHoldRef.current = true
+      holdSourceRef.current = 'keyboard'
+      void startVoiceCapture()
+    }
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.code === 'Space' && holdSourceRef.current === 'keyboard') {
+        holdSourceRef.current = null
+        stopVoiceCapture()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('keyup', handleKeyUp)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('keyup', handleKeyUp)
+    }
+  }, [
+    isEditingNote,
+    isSettingsOpen,
+    startVoiceCapture,
+    stopVoiceCapture,
+    voiceState,
+  ])
 
   return (
     <div className={`app-shell${isEditingNote ? ' is-note-editing' : ''}`}>
@@ -176,7 +570,9 @@ function App() {
         >
           <span aria-hidden="true">⚙</span>
           Settings
-          {speechSettings.apiKey && <span className="settings-indicator" aria-label="API key saved" />}
+          {speechSettings.apiKey && (
+            <span className="settings-indicator" aria-label="API key saved" />
+          )}
         </button>
       </header>
 
@@ -262,8 +658,74 @@ function App() {
                 : 'Your thoughts will sit beside the words that sparked them.'}
             </p>
           </div>
+          {activeParagraphIndex !== null && (
+            <button
+              className={`voice-capture${voiceState === 'recording' ? ' is-recording' : ''}`}
+              type="button"
+              aria-pressed={voiceState === 'recording'}
+              disabled={voiceState === 'transcribing' || isEditingNote}
+              onPointerDown={(event) => {
+                event.preventDefault()
+                if (!speechSettings.apiKey) {
+                  setSettingsDraft(speechSettings)
+                  setIsSettingsOpen(true)
+                  return
+                }
+                voiceHoldRef.current = true
+                holdSourceRef.current = 'pointer'
+                void startVoiceCapture()
+              }}
+              onPointerUp={() => {
+                if (holdSourceRef.current === 'pointer') {
+                  holdSourceRef.current = null
+                  stopVoiceCapture()
+                }
+              }}
+              onPointerLeave={() => {
+                if (holdSourceRef.current === 'pointer') {
+                  holdSourceRef.current = null
+                  stopVoiceCapture()
+                }
+              }}
+              onPointerCancel={() => {
+                if (holdSourceRef.current === 'pointer') {
+                  holdSourceRef.current = null
+                  stopVoiceCapture()
+                }
+              }}
+            >
+              <span className="voice-indicator" aria-hidden="true" />
+              {voiceState === 'recording'
+                ? 'Release to finish thought'
+                : voiceState === 'transcribing'
+                  ? 'Transcribing…'
+                  : speechSettings.apiKey
+                    ? 'Hold to speak a thought'
+                    : 'Add API key to speak'}
+            </button>
+          )}
+          {voiceState !== 'idle' && (
+            <div
+              className={`voice-status${voiceState === 'error' ? ' has-error' : ''}`}
+              role="status"
+            >
+              {voiceState === 'recording'
+                ? 'Listening — release to finish your thought.'
+                : voiceState === 'transcribing'
+                  ? 'Writing your thought in the margin…'
+                  : voiceError}
+            </div>
+          )}
           {activeParagraphIndex === null ? (
             <p className="rail-footnote">Select a passage to attach a note.</p>
+          ) : isLivePreview && noteDraft ? (
+            <div className="saved-note live-note">
+              <div className="saved-note-header">
+                <p className="saved-note-label">YOUR THOUGHT</p>
+                <span className="saved-note-status">WRITING</span>
+              </div>
+              <p className="saved-note-text">{noteDraft}</p>
+            </div>
           ) : activeNote && !isEditingNote ? (
             <div className="saved-note">
               <div className="saved-note-header">
@@ -396,8 +858,13 @@ function App() {
 
       <div className="keyboard-hint" aria-hidden="true">
         <span className="keyboard-key">SPACE</span>
-        <span>to capture a thought</span>
-        <span className="hint-soon">coming soon</span>
+        <span>
+          {activeParagraphIndex === null
+            ? 'select a passage first'
+            : voiceState === 'recording'
+              ? 'release to finish thought'
+              : 'hold to speak'}
+        </span>
       </div>
 
       {isSettingsOpen && (
@@ -434,7 +901,10 @@ function App() {
               onSubmit={(event) => {
                 event.preventDefault()
                 try {
-                  window.localStorage.setItem(SPEECH_SETTINGS_KEY, JSON.stringify(settingsDraft))
+                  window.localStorage.setItem(
+                    SPEECH_SETTINGS_KEY,
+                    JSON.stringify(settingsDraft),
+                  )
                   setSpeechSettings(settingsDraft)
                   setSettingsSaved(true)
                   setSettingsStorageError(false)
@@ -445,7 +915,9 @@ function App() {
               }}
             >
               <p className="settings-provider">NVIDIA NIM</p>
-              <label className="settings-label" htmlFor="speech-api-key">NVIDIA NIM API key</label>
+              <label className="settings-label" htmlFor="speech-api-key">
+                NVIDIA NIM API key
+              </label>
               <input
                 id="speech-api-key"
                 type="password"
@@ -454,11 +926,16 @@ function App() {
                 placeholder="Paste your NVIDIA NIM API key"
                 value={settingsDraft.apiKey}
                 onChange={(event) => {
-                  setSettingsDraft({ ...settingsDraft, apiKey: event.target.value })
+                  setSettingsDraft({
+                    ...settingsDraft,
+                    apiKey: event.target.value,
+                  })
                   setSettingsSaved(false)
                 }}
               />
-              <label className="settings-label" htmlFor="speech-model">Speech model</label>
+              <label className="settings-label" htmlFor="speech-model">
+                Speech model
+              </label>
               <select
                 id="speech-model"
                 value={settingsDraft.modelId}
@@ -477,16 +954,25 @@ function App() {
                 ))}
               </select>
               <p className="settings-model-note">
-                {speechModels.find((model) => model.id === settingsDraft.modelId)?.mode}
+                {
+                  speechModels.find(
+                    (model) => model.id === settingsDraft.modelId,
+                  )?.mode
+                }
               </p>
               <p className="settings-storage-note">
-                Key and selection are saved in this browser. Voice capture is not connected yet.
+                The key is stored in this browser. Recorded audio is sent to
+                NVIDIA for transcription.
               </p>
               <div className="settings-footer">
                 {settingsStorageError ? (
-                  <span className="settings-feedback error">Could not save in browser storage.</span>
+                  <span className="settings-feedback error">
+                    Could not save in browser storage.
+                  </span>
                 ) : settingsSaved ? (
-                  <span className="settings-feedback">Key saved on this device.</span>
+                  <span className="settings-feedback">
+                    Key saved on this device.
+                  </span>
                 ) : speechSettings.apiKey ? (
                   <button
                     className="text-button danger"
@@ -497,7 +983,10 @@ function App() {
                         const cleared = { ...settingsDraft, apiKey: '' }
                         setSettingsDraft(cleared)
                         setSpeechSettings(cleared)
-                        window.localStorage.setItem(SPEECH_SETTINGS_KEY, JSON.stringify(cleared))
+                        window.localStorage.setItem(
+                          SPEECH_SETTINGS_KEY,
+                          JSON.stringify(cleared),
+                        )
                         setSettingsSaved(false)
                       } catch {
                         setSettingsStorageError(true)
@@ -506,8 +995,14 @@ function App() {
                   >
                     Remove saved key
                   </button>
-                ) : <span />}
-                <button className="save-note settings-save" type="submit" disabled={!settingsDraft.apiKey.trim()}>
+                ) : (
+                  <span />
+                )}
+                <button
+                  className="save-note settings-save"
+                  type="submit"
+                  disabled={!settingsDraft.apiKey.trim()}
+                >
                   Save settings <span aria-hidden="true">↗</span>
                 </button>
               </div>
