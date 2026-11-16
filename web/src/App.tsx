@@ -501,7 +501,8 @@ if (articleSections.length < 2 && paragraphs.length > 1) {
     const preview = text.trim().replace(/\s+/g, ' ')
     articleSections.push({
       index,
-      title: preview.length > 90 ? `${preview.slice(0, 87).trimEnd()}…` : preview,
+      title:
+        preview.length > 90 ? `${preview.slice(0, 87).trimEnd()}…` : preview,
     })
   })
 }
@@ -734,6 +735,8 @@ function App() {
   const [articleError, setArticleError] = useState('')
   const [library, setLibrary] = useState<ImportedArticle[]>(loadLibrary)
   const [libraryOpen, setLibraryOpen] = useState(false)
+  const [largeText, setLargeText] = useState(false)
+  const [marginOpen, setMarginOpen] = useState(false)
   const [readingPositions, setReadingPositions] = useState(loadReadingPositions)
   const [readingProgress, setReadingProgress] = useState(0)
   const [activeParagraphIndex, setActiveParagraphIndex] = useState<
@@ -1779,6 +1782,7 @@ function App() {
         isEditingNote ||
         (isVoiceEditing && !voiceEditSelection) ||
         isSettingsOpen ||
+        libraryOpen ||
         voiceState === 'recording' ||
         voiceState === 'transcribing'
       )
@@ -1803,6 +1807,7 @@ function App() {
     isEditingNote,
     isVoiceEditing,
     isSettingsOpen,
+    libraryOpen,
     startVoiceCapture,
     stopVoiceCapture,
     voiceState,
@@ -1810,16 +1815,38 @@ function App() {
   ])
 
   return (
-    <div className={`app-shell${isEditingNote ? ' is-note-editing' : ''}`}>
+    <div
+      className={`app-shell${isEditingNote ? ' is-note-editing' : ''}${largeText ? ' is-large-text' : ''}${marginOpen ? ' is-margin-open' : ''}`}
+    >
       <header className="topbar">
-        <a className="brand" href="#top" aria-label="Margin home">
+        <a
+          className="brand"
+          href="#top"
+          aria-label="Margin home"
+          onClick={() => setLibraryOpen(true)}
+        >
           <BrandMark />
           <span>margin</span>
         </a>
-        <span className="sample-badge">
-          <span className="sample-dot" />
-          Sample reading
-        </span>
+        <div className="reader-toolbar">
+          <button
+            type="button"
+            className={`toolbar-button${libraryOpen ? ' is-current' : ''}`}
+            onClick={() => setLibraryOpen(!libraryOpen)}
+            aria-pressed={libraryOpen}
+          >
+            {libraryOpen ? '← Back to reading' : 'Library'}
+          </button>
+          <button
+            type="button"
+            className="toolbar-button type-control"
+            aria-label="Use larger reading text"
+            aria-pressed={largeText}
+            onClick={() => setLargeText(!largeText)}
+          >
+            Aa
+          </button>
+        </div>
         <button
           className="settings-trigger"
           type="button"
@@ -1845,677 +1872,717 @@ function App() {
         <span style={{ transform: `scaleX(${readingProgress})` }} />
       </div>
 
-      <section className="library-bar" aria-label="Your reading library">
-        <button
-          type="button"
-          className="library-toggle"
-          aria-expanded={libraryOpen}
-          onClick={() => setLibraryOpen(!libraryOpen)}
-        >
-          <span>Reading library</span>
-          <span>{library.length} saved</span>
-          <span aria-hidden="true">{libraryOpen ? '−' : '+'}</span>
-        </button>
-        {libraryOpen && (
-          <div className="library-list">
-            {library.length === 0 ? (
-              <p>Your saved articles will appear here.</p>
-            ) : (
-              library.map((article) => (
-                <article className="library-item" key={article.url}>
-                  <button
-                    type="button"
-                    className="library-open"
-                    onClick={() => openSavedArticle(article)}
-                  >
-                    <strong>{article.title}</strong>
-                    <span>{new URL(article.url).hostname}</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="library-remove"
-                    aria-label={`Remove ${article.title} from library`}
-                    onClick={() => removeSavedArticle(article.url)}
-                  >
-                    Remove
-                  </button>
-                </article>
-              ))
-            )}
-          </div>
-        )}
-      </section>
-      <form
-        className="article-import"
-        onSubmit={(event) => void openArticle(event)}
-      >
-        <label htmlFor="article-url">What would you like to read?</label>
-        <div className="article-import-row">
-          <input
-            id="article-url"
-            type="url"
-            required
-            placeholder="Paste an article link"
-            value={articleUrl}
-            onChange={(event) => setArticleUrl(event.target.value)}
-            disabled={articleLoading}
-          />
-          <button type="submit" disabled={articleLoading}>
-            {articleLoading ? 'Opening…' : 'Open article'}
-          </button>
+      <div className="library-workspace" hidden={!libraryOpen}>
+        <div className="library-intro">
+          <p className="eyebrow">YOUR READING ROOM</p>
+          <h1>
+            A little room
+            <br />
+            for your thoughts.
+          </h1>
+          <p>
+            Bring something worth reading. Leave with something of your own.
+          </p>
         </div>
-        {articleError && <p role="alert">{articleError}</p>}
-        {importedArticle && (
-          <button
-            type="button"
-            className="text-button"
-            onClick={() => {
-              localStorage.removeItem('margin:current-article')
-              window.location.reload()
-            }}
+        <section className="library-bar" aria-label="Your reading library">
+          <div className="library-heading">
+            <h2>On your shelf</h2>
+            <span>{library.length} saved articles</span>
+          </div>
+          {libraryOpen && (
+            <div className="library-list">
+              {library.length === 0 ? (
+                <p className="library-empty">
+                  Your shelf starts with one good article. Paste a link below to
+                  begin.
+                </p>
+              ) : (
+                library.map((article) => (
+                  <article className="library-item" key={article.url}>
+                    <button
+                      type="button"
+                      className="library-open"
+                      onClick={() => openSavedArticle(article)}
+                    >
+                      <strong>{article.title}</strong>
+                      <span>{new URL(article.url).hostname}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="library-remove"
+                      aria-label={`Remove ${article.title} from library`}
+                      onClick={() => removeSavedArticle(article.url)}
+                    >
+                      Remove
+                    </button>
+                  </article>
+                ))
+              )}
+            </div>
+          )}
+        </section>
+        <form
+          className="article-import"
+          onSubmit={(event) => void openArticle(event)}
+        >
+          <label htmlFor="article-url">What would you like to read?</label>
+          <div className="article-import-row">
+            <input
+              id="article-url"
+              type="url"
+              required
+              placeholder="Paste an article link"
+              value={articleUrl}
+              onChange={(event) => setArticleUrl(event.target.value)}
+              disabled={articleLoading}
+            />
+            <button type="submit" disabled={articleLoading}>
+              {articleLoading ? 'Opening…' : 'Open article'}
+            </button>
+          </div>
+          {articleError && <p role="alert">{articleError}</p>}
+          {importedArticle && (
+            <button
+              type="button"
+              className="text-button"
+              onClick={() => {
+                localStorage.removeItem('margin:current-article')
+                window.location.reload()
+              }}
+            >
+              Read the sample essay
+            </button>
+          )}
+        </form>
+      </div>
+      <div hidden={libraryOpen}>
+        <ArticleOutline sections={articleSections} />
+        {importedArticle &&
+          readingPositions[importedArticle.url] !== undefined && (
+            <button
+              type="button"
+              className="resume-reading"
+              onClick={() =>
+                document
+                  .querySelector<HTMLElement>(
+                    `[data-paragraph-index="${readingPositions[importedArticle.url]}"]`,
+                  )
+                  ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+              }
+            >
+              Resume reading <span>{Math.round(readingProgress * 100)}%</span>
+            </button>
+          )}
+        <main className="reader-layout" id="top">
+          <article className="article">
+            <div className="article-heading">
+              <p className="eyebrow">A NOTE ON READING</p>
+              <h1>{ARTICLE_TITLE}</h1>
+              {!importedArticle && (
+                <p className="dek">
+                  Reading is more than taking in someone else’s words. It is a
+                  chance to notice what those words stir in you.
+                </p>
+              )}
+              <div className="byline">
+                <span className="byline-avatar" aria-hidden="true">
+                  M
+                </span>
+                <span className="byline-name">
+                  {importedArticle
+                    ? (importedArticle.author ??
+                      new URL(importedArticle.url).hostname)
+                    : 'Margin sample'}
+                </span>
+                <span className="byline-separator" aria-hidden="true">
+                  ·
+                </span>
+                <span>
+                  {Math.max(
+                    1,
+                    Math.ceil(paragraphs.join(' ').split(/\s+/).length / 220),
+                  )}{' '}
+                  min read
+                </span>
+                <span className="byline-separator" aria-hidden="true">
+                  ·
+                </span>
+                <span>
+                  {importedArticle ? (
+                    <a
+                      href={importedArticle.url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Original article ↗
+                    </a>
+                  ) : (
+                    'Demo essay'
+                  )}
+                </span>
+              </div>
+            </div>
+
+            <div className="article-body">
+              {paragraphs.map((paragraph, index) => (
+                <div
+                  key={`${index}-${paragraph}`}
+                  role={
+                    importedArticle?.blocks?.[index]?.type === 'heading'
+                      ? 'heading'
+                      : undefined
+                  }
+                  aria-level={
+                    importedArticle?.blocks?.[index]?.type === 'heading'
+                      ? 2
+                      : undefined
+                  }
+                  className={`article-paragraph article-block-${importedArticle?.blocks?.[index]?.type ?? 'paragraph'}${focusedParagraphIndex === index ? ' is-active' : ''}`}
+                  data-paragraph-index={index}
+                  tabIndex={0}
+                  onMouseEnter={() => {
+                    if (!isEditingNote) selectParagraph(index)
+                  }}
+                  onClick={() => selectParagraph(index)}
+                  onFocus={() => selectParagraph(index)}
+                  onBlur={(event) => {
+                    const reader = event.currentTarget.closest('.reader-layout')
+                    if (!reader?.contains(event.relatedTarget as Node | null)) {
+                      setActiveParagraphIndex(null)
+                    }
+                  }}
+                >
+                  {paragraph}
+                </div>
+              ))}
+            </div>
+
+            <footer className="article-footer">
+              <span className="footer-rule" />
+              <span>You’ve reached the end.</span>
+              <span className="footer-rule" />
+            </footer>
+          </article>
+
+          <aside
+            className="margin-rail"
+            id="margin-notes"
+            aria-label="Margin notes"
           >
-            Read the sample essay
-          </button>
-        )}
-      </form>
-      <ArticleOutline sections={articleSections} />
-      {importedArticle &&
-        readingPositions[importedArticle.url] !== undefined && (
-          <button
-            type="button"
-            className="resume-reading"
-            onClick={() =>
-              document
-                .querySelector<HTMLElement>(
-                  `[data-paragraph-index="${readingPositions[importedArticle.url]}"]`,
-                )
-                ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-            }
-          >
-            Resume reading <span>{Math.round(readingProgress * 100)}%</span>
-          </button>
-        )}
-      <main className="reader-layout" id="top">
-        <article className="article">
-          <div className="article-heading">
-            <p className="eyebrow">A NOTE ON READING</p>
-            <h1>{ARTICLE_TITLE}</h1>
-            {!importedArticle && (
-              <p className="dek">
-                Reading is more than taking in someone else’s words. It is a
-                chance to notice what those words stir in you.
-              </p>
-            )}
-            <div className="byline">
-              <span className="byline-avatar" aria-hidden="true">
-                M
+            <button
+              className="mobile-margin-close"
+              type="button"
+              onClick={() => setMarginOpen(false)}
+            >
+              Close thoughts <span aria-hidden="true">↓</span>
+            </button>
+            <div className="rail-heading">
+              <span className="rail-label">
+                {focusedParagraph ? 'IN FOCUS' : 'YOUR MARGIN'}
               </span>
-              <span className="byline-name">
-                {importedArticle
-                  ? (importedArticle.author ??
-                    new URL(importedArticle.url).hostname)
-                  : 'Margin sample'}
-              </span>
-              <span className="byline-separator" aria-hidden="true">
-                ·
-              </span>
-              <span>
-                {Math.max(
-                  1,
-                  Math.ceil(paragraphs.join(' ').split(/\s+/).length / 220),
-                )}{' '}
-                min read
-              </span>
-              <span className="byline-separator" aria-hidden="true">
-                ·
-              </span>
-              <span>
-                {importedArticle ? (
-                  <a
-                    href={importedArticle.url}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    Original article ↗
-                  </a>
-                ) : (
-                  'Demo essay'
-                )}
+              <span className="rail-count">
+                {focusedParagraphIndex === null
+                  ? '—'
+                  : `${String(focusedParagraphIndex + 1).padStart(2, '0')} / ${String(paragraphs.length).padStart(2, '0')}`}
               </span>
             </div>
-          </div>
-
-          <div className="article-body">
-            {paragraphs.map((paragraph, index) => (
-              <div
-                key={`${index}-${paragraph}`}
-                role={
-                  importedArticle?.blocks?.[index]?.type === 'heading'
-                    ? 'heading'
-                    : undefined
+            <div className="rail-empty">
+              <span className="rail-spark" aria-hidden="true">
+                ✳
+              </span>
+              <p className="rail-title">
+                {focusedParagraph
+                  ? `Passage ${focusedParagraphIndex! + 1}`
+                  : 'A little room to think.'}
+              </p>
+              <p className="rail-copy">
+                {focusedParagraph
+                  ? `“${focusedParagraph.slice(0, 100)}${focusedParagraph.length > 100 ? '…' : ''}”`
+                  : 'Your thoughts will sit beside the words that sparked them.'}
+              </p>
+            </div>
+            {visibleRelatedThought && activeParagraphIndex !== null && (
+              <section
+                className="related-thought"
+                aria-label="A thought from your margins"
+              >
+                <div className="related-thought-heading">
+                  <span className="related-thought-kicker">
+                    A THOUGHT RETURNS
+                  </span>
+                  <time dateTime={visibleRelatedThought.createdAt}>
+                    {new Intl.DateTimeFormat(undefined, {
+                      month: 'short',
+                      day: 'numeric',
+                    }).format(new Date(visibleRelatedThought.createdAt))}
+                  </time>
+                </div>
+                <blockquote>{visibleRelatedThought.note}</blockquote>
+                <p className="related-thought-source">
+                  From {visibleRelatedThought.articleTitle ?? ARTICLE_TITLE}
+                </p>
+                <div className="related-thought-actions">
+                  <button
+                    className="text-button"
+                    type="button"
+                    onClick={() =>
+                      returnToRelatedPassage(
+                        visibleRelatedThought.paragraphIndex,
+                      )
+                    }
+                  >
+                    Return to that passage <span aria-hidden="true">↗</span>
+                  </button>
+                  <button
+                    className="text-button text-button-subtle"
+                    type="button"
+                    onClick={() =>
+                      void dismissRelatedThought(visibleRelatedThought)
+                    }
+                  >
+                    Not related
+                  </button>
+                </div>
+              </section>
+            )}
+            {isMemoryPending && activeNote && (
+              <p className="memory-pending" role="status">
+                Looking through your margins…
+              </p>
+            )}
+            {hasMemoryError &&
+              activeParagraphIndex !== null &&
+              Object.values(notes).some((note) => note.trim()) && (
+                <p className="memory-error" role="status">
+                  Your note is saved here. Margin connections are temporarily
+                  unavailable.
+                </p>
+              )}
+            {!speechSettings.apiKey &&
+              activeParagraphIndex !== null &&
+              Object.keys(notes).length > 0 &&
+              !visibleRelatedThought && (
+                <p className="memory-pending">
+                  Add an NVIDIA key in Settings to find returning thoughts.
+                </p>
+              )}
+            {activeParagraphIndex !== null && (
+              <button
+                className={`voice-capture${voiceState === 'recording' ? ' is-recording' : ''}`}
+                type="button"
+                aria-pressed={voiceState === 'recording'}
+                disabled={
+                  voiceState === 'transcribing' ||
+                  isEditingNote ||
+                  (isVoiceEditing && !voiceEditSelection)
                 }
-                aria-level={
-                  importedArticle?.blocks?.[index]?.type === 'heading'
-                    ? 2
-                    : undefined
-                }
-                className={`article-paragraph article-block-${importedArticle?.blocks?.[index]?.type ?? 'paragraph'}${focusedParagraphIndex === index ? ' is-active' : ''}`}
-                data-paragraph-index={index}
-                tabIndex={0}
-                onMouseEnter={() => {
-                  if (!isEditingNote) selectParagraph(index)
+                onPointerDown={(event) => {
+                  event.preventDefault()
+                  if (!speechSettings.apiKey) {
+                    setSettingsDraft(speechSettings)
+                    setIsSettingsOpen(true)
+                    return
+                  }
+                  voiceHoldRef.current = true
+                  holdSourceRef.current = 'pointer'
+                  void startVoiceCapture()
                 }}
-                onClick={() => selectParagraph(index)}
-                onFocus={() => selectParagraph(index)}
-                onBlur={(event) => {
-                  const reader = event.currentTarget.closest('.reader-layout')
-                  if (!reader?.contains(event.relatedTarget as Node | null)) {
-                    setActiveParagraphIndex(null)
+                onPointerUp={() => {
+                  if (holdSourceRef.current === 'pointer') {
+                    holdSourceRef.current = null
+                    stopVoiceCapture()
+                  }
+                }}
+                onPointerLeave={() => {
+                  if (holdSourceRef.current === 'pointer') {
+                    holdSourceRef.current = null
+                    stopVoiceCapture()
+                  }
+                }}
+                onPointerCancel={() => {
+                  if (holdSourceRef.current === 'pointer') {
+                    holdSourceRef.current = null
+                    stopVoiceCapture()
                   }
                 }}
               >
-                {paragraph}
-              </div>
-            ))}
-          </div>
-
-          <footer className="article-footer">
-            <span className="footer-rule" />
-            <span>You’ve reached the end.</span>
-            <span className="footer-rule" />
-          </footer>
-        </article>
-
-        <aside className="margin-rail" aria-label="Margin notes">
-          <div className="rail-heading">
-            <span className="rail-label">
-              {focusedParagraph ? 'IN FOCUS' : 'YOUR MARGIN'}
-            </span>
-            <span className="rail-count">
-              {focusedParagraphIndex === null
-                ? '—'
-                : `${String(focusedParagraphIndex + 1).padStart(2, '0')} / ${String(paragraphs.length).padStart(2, '0')}`}
-            </span>
-          </div>
-          <div className="rail-empty">
-            <span className="rail-spark" aria-hidden="true">
-              ✳
-            </span>
-            <p className="rail-title">
-              {focusedParagraph
-                ? `Passage ${focusedParagraphIndex! + 1}`
-                : 'A little room to think.'}
-            </p>
-            <p className="rail-copy">
-              {focusedParagraph
-                ? `“${focusedParagraph.slice(0, 100)}${focusedParagraph.length > 100 ? '…' : ''}”`
-                : 'Your thoughts will sit beside the words that sparked them.'}
-            </p>
-          </div>
-          {visibleRelatedThought && activeParagraphIndex !== null && (
-            <section
-              className="related-thought"
-              aria-label="A thought from your margins"
-            >
-              <div className="related-thought-heading">
-                <span className="related-thought-kicker">
-                  A THOUGHT RETURNS
-                </span>
-                <time dateTime={visibleRelatedThought.createdAt}>
-                  {new Intl.DateTimeFormat(undefined, {
-                    month: 'short',
-                    day: 'numeric',
-                  }).format(new Date(visibleRelatedThought.createdAt))}
-                </time>
-              </div>
-              <blockquote>{visibleRelatedThought.note}</blockquote>
-              <p className="related-thought-source">
-                From {visibleRelatedThought.articleTitle ?? ARTICLE_TITLE}
-              </p>
-              <div className="related-thought-actions">
-                <button
-                  className="text-button"
-                  type="button"
-                  onClick={() =>
-                    returnToRelatedPassage(visibleRelatedThought.paragraphIndex)
-                  }
-                >
-                  Return to that passage <span aria-hidden="true">↗</span>
-                </button>
-                <button
-                  className="text-button text-button-subtle"
-                  type="button"
-                  onClick={() =>
-                    void dismissRelatedThought(visibleRelatedThought)
-                  }
-                >
-                  Not related
-                </button>
-              </div>
-            </section>
-          )}
-          {isMemoryPending && activeNote && (
-            <p className="memory-pending" role="status">
-              Looking through your margins…
-            </p>
-          )}
-          {hasMemoryError &&
-            activeParagraphIndex !== null &&
-            Object.values(notes).some((note) => note.trim()) && (
-              <p className="memory-error" role="status">
-                Your note is saved here. Margin connections are temporarily
-                unavailable.
-              </p>
+                <span className="voice-indicator" aria-hidden="true" />
+                {voiceState === 'recording'
+                  ? isVoiceEditing
+                    ? 'Release to replace selection'
+                    : 'Release to finish thought'
+                  : voiceState === 'transcribing'
+                    ? 'Transcribing…'
+                    : isVoiceEditing
+                      ? voiceEditSelection
+                        ? 'Hold to replace selection'
+                        : 'Choose a word to edit'
+                      : speechSettings.apiKey
+                        ? 'Hold to speak a thought'
+                        : 'Add API key to speak'}
+              </button>
             )}
-          {!speechSettings.apiKey &&
-            activeParagraphIndex !== null &&
-            Object.keys(notes).length > 0 &&
-            !visibleRelatedThought && (
-              <p className="memory-pending">
-                Add an NVIDIA key in Settings to find returning thoughts.
-              </p>
+            {voiceState !== 'idle' && (
+              <div
+                className={`voice-status${voiceState === 'error' ? ' has-error' : ''}`}
+                role="status"
+              >
+                {voiceState === 'recording'
+                  ? isVoiceEditing
+                    ? 'Listening — release to replace the selected words.'
+                    : 'Listening — release to finish your thought.'
+                  : voiceState === 'transcribing'
+                    ? 'Writing your thought in the margin…'
+                    : voiceError}
+              </div>
             )}
-          {activeParagraphIndex !== null && (
-            <button
-              className={`voice-capture${voiceState === 'recording' ? ' is-recording' : ''}`}
-              type="button"
-              aria-pressed={voiceState === 'recording'}
-              disabled={
-                voiceState === 'transcribing' ||
-                isEditingNote ||
-                (isVoiceEditing && !voiceEditSelection)
-              }
-              onPointerDown={(event) => {
-                event.preventDefault()
-                if (!speechSettings.apiKey) {
-                  setSettingsDraft(speechSettings)
-                  setIsSettingsOpen(true)
-                  return
-                }
-                voiceHoldRef.current = true
-                holdSourceRef.current = 'pointer'
-                void startVoiceCapture()
-              }}
-              onPointerUp={() => {
-                if (holdSourceRef.current === 'pointer') {
-                  holdSourceRef.current = null
-                  stopVoiceCapture()
-                }
-              }}
-              onPointerLeave={() => {
-                if (holdSourceRef.current === 'pointer') {
-                  holdSourceRef.current = null
-                  stopVoiceCapture()
-                }
-              }}
-              onPointerCancel={() => {
-                if (holdSourceRef.current === 'pointer') {
-                  holdSourceRef.current = null
-                  stopVoiceCapture()
-                }
-              }}
-            >
-              <span className="voice-indicator" aria-hidden="true" />
-              {voiceState === 'recording'
-                ? isVoiceEditing
-                  ? 'Release to replace selection'
-                  : 'Release to finish thought'
-                : voiceState === 'transcribing'
-                  ? 'Transcribing…'
-                  : isVoiceEditing
-                    ? voiceEditSelection
-                      ? 'Hold to replace selection'
-                      : 'Choose a word to edit'
-                    : speechSettings.apiKey
-                      ? 'Hold to speak a thought'
-                      : 'Add API key to speak'}
-            </button>
-          )}
-          {voiceState !== 'idle' && (
-            <div
-              className={`voice-status${voiceState === 'error' ? ' has-error' : ''}`}
-              role="status"
-            >
-              {voiceState === 'recording'
-                ? isVoiceEditing
-                  ? 'Listening — release to replace the selected words.'
-                  : 'Listening — release to finish your thought.'
-                : voiceState === 'transcribing'
-                  ? 'Writing your thought in the margin…'
-                  : voiceError}
-            </div>
-          )}
-          {activeParagraphIndex === null ? (
-            <p className="rail-footnote">Select a passage to attach a note.</p>
-          ) : isLivePreview && noteDraft ? (
-            <div className="saved-note live-note">
-              <div className="saved-note-header">
-                <p className="saved-note-label">
-                  {isVoiceEditing ? 'VOICE EDIT' : 'YOUR THOUGHT'}
-                </p>
-                <span className="saved-note-status">WRITING</span>
-              </div>
-              <p className="saved-note-text">{noteDraft}</p>
-            </div>
-          ) : activeNote && !isEditingNote ? (
-            <div className="saved-note">
-              <div className="saved-note-header">
-                <p className="saved-note-label">
-                  {isVoiceEditing ? 'EDITING BY VOICE' : 'YOUR THOUGHT'}
-                </p>
-                <span className="saved-note-status">
-                  {isVoiceEditing ? 'SELECT A WORD' : 'SAVED'}
-                </span>
-              </div>
-              {isVoiceEditing ? (
-                <p className="review-note-hint">
-                  Tap a word. Choose “Extend to phrase” to include more words,
-                  or use Shift and the arrow keys.
-                </p>
-              ) : (
-                activeReview?.segments.some((segment) =>
-                  segment.alternatives.some(
-                    (alternative) => alternative !== segment.selected,
-                  ),
-                ) && (
-                  <p className="review-note-hint">
-                    Underlined words have another take. Tap one to choose a
-                    version.
+            {activeParagraphIndex === null ? (
+              <p className="rail-footnote">
+                Select a passage to attach a note.
+              </p>
+            ) : isLivePreview && noteDraft ? (
+              <div className="saved-note live-note">
+                <div className="saved-note-header">
+                  <p className="saved-note-label">
+                    {isVoiceEditing ? 'VOICE EDIT' : 'YOUR THOUGHT'}
                   </p>
-                )
-              )}
-              {isVoiceEditing ? (
-                renderVoiceEditWords(activeNote)
-              ) : activeReview ? (
-                renderTranscript(activeReview)
-              ) : (
-                <p className="saved-note-text">{activeNote}</p>
-              )}
-              {isVoiceEditing && (
-                <div className="voice-edit-panel">
-                  <div className="voice-edit-panel-header">
-                    <p className="correction-label">
-                      {voiceEditSelection
-                        ? `SELECTED: ${activeNote.slice(voiceEditSelection.start, voiceEditSelection.end)}`
-                        : 'CHOOSE A WORD OR PHRASE'}
-                    </p>
-                    <button
-                      className={`text-button${isExtendingSelection ? ' is-active' : ''}`}
-                      type="button"
-                      aria-pressed={isExtendingSelection}
-                      onClick={() =>
-                        setIsExtendingSelection((current) => !current)
-                      }
-                    >
-                      {isExtendingSelection
-                        ? 'Tap end of phrase'
-                        : 'Extend to phrase'}
-                    </button>
-                  </div>
-                  {voiceEditSelection && voiceEditAlternatives.length > 0 && (
-                    <div className="correction-options">
-                      <p className="correction-hint">
-                        Another way NVIDIA heard it
-                      </p>
-                      {voiceEditAlternatives.map((alternative) => (
-                        <button
-                          className="correction-option"
-                          type="button"
-                          key={alternative}
-                          onClick={() => applyVoiceEditReplacement(alternative)}
-                        >
-                          {alternative}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  {voiceEditUndo?.paragraphIndex === activeParagraphIndex && (
-                    <button
-                      className="text-button voice-edit-undo"
-                      type="button"
-                      onClick={undoVoiceEdit}
-                    >
-                      Undo last change
-                    </button>
-                  )}
-                  <div className="voice-edit-actions">
-                    <button
-                      className="text-button"
-                      type="button"
-                      onClick={() => {
-                        setNoteDraft(activeNote)
-                        setIsVoiceEditing(false)
-                        setVoiceEditSelection(null)
-                        setIsExtendingSelection(false)
-                      }}
-                    >
-                      Done
-                    </button>
-                    <button
-                      className="text-button text-button-subtle"
-                      type="button"
-                      onClick={() => {
-                        setNoteDraft(activeNote)
-                        setIsVoiceEditing(false)
-                        setVoiceEditSelection(null)
-                        setIsEditingNote(true)
-                      }}
-                    >
-                      Edit with keyboard
-                    </button>
-                  </div>
+                  <span className="saved-note-status">WRITING</span>
                 </div>
-              )}
-              {!isVoiceEditing &&
-                activeReview &&
-                openCorrection &&
-                activeCorrectionSegment && (
-                  <div className="correction-panel">
-                    <div className="correction-panel-header">
-                      <div>
-                        <p className="correction-label">A DIFFERENT TAKE</p>
-                        <p className="correction-hint">
-                          Tap a version that sounds like what you said.
-                        </p>
-                      </div>
+                <p className="saved-note-text">{noteDraft}</p>
+              </div>
+            ) : activeNote && !isEditingNote ? (
+              <div className="saved-note">
+                <div className="saved-note-header">
+                  <p className="saved-note-label">
+                    {isVoiceEditing ? 'EDITING BY VOICE' : 'YOUR THOUGHT'}
+                  </p>
+                  <span className="saved-note-status">
+                    {isVoiceEditing ? 'SELECT A WORD' : 'SAVED'}
+                  </span>
+                </div>
+                {isVoiceEditing ? (
+                  <p className="review-note-hint">
+                    Tap a word. Choose “Extend to phrase” to include more words,
+                    or use Shift and the arrow keys.
+                  </p>
+                ) : (
+                  activeReview?.segments.some((segment) =>
+                    segment.alternatives.some(
+                      (alternative) => alternative !== segment.selected,
+                    ),
+                  ) && (
+                    <p className="review-note-hint">
+                      Underlined words have another take. Tap one to choose a
+                      version.
+                    </p>
+                  )
+                )}
+                {isVoiceEditing ? (
+                  renderVoiceEditWords(activeNote)
+                ) : activeReview ? (
+                  renderTranscript(activeReview)
+                ) : (
+                  <p className="saved-note-text">{activeNote}</p>
+                )}
+                {isVoiceEditing && (
+                  <div className="voice-edit-panel">
+                    <div className="voice-edit-panel-header">
+                      <p className="correction-label">
+                        {voiceEditSelection
+                          ? `SELECTED: ${activeNote.slice(voiceEditSelection.start, voiceEditSelection.end)}`
+                          : 'CHOOSE A WORD OR PHRASE'}
+                      </p>
                       <button
-                        className="text-button"
+                        className={`text-button${isExtendingSelection ? ' is-active' : ''}`}
                         type="button"
-                        onClick={() => setOpenCorrection(null)}
-                        aria-label="Close word suggestions"
+                        aria-pressed={isExtendingSelection}
+                        onClick={() =>
+                          setIsExtendingSelection((current) => !current)
+                        }
                       >
-                        Done
+                        {isExtendingSelection
+                          ? 'Tap end of phrase'
+                          : 'Extend to phrase'}
                       </button>
                     </div>
-                    <div className="correction-options">
-                      {activeCorrectionSegment.alternatives
-                        .filter(
-                          (alternative) =>
-                            alternative !== activeCorrectionSegment.selected,
-                        )
-                        .map((alternative) => (
+                    {voiceEditSelection && voiceEditAlternatives.length > 0 && (
+                      <div className="correction-options">
+                        <p className="correction-hint">
+                          Another way NVIDIA heard it
+                        </p>
+                        {voiceEditAlternatives.map((alternative) => (
                           <button
                             className="correction-option"
                             type="button"
                             key={alternative}
                             onClick={() =>
-                              chooseAlternative(
-                                openCorrection.segmentIndex,
-                                alternative,
-                              )
+                              applyVoiceEditReplacement(alternative)
                             }
                           >
                             {alternative}
                           </button>
                         ))}
-                    </div>
-                  </div>
-                )}
-              {!isVoiceEditing && (
-                <div className="note-actions">
-                  {confirmingDelete ? (
-                    <>
-                      <span className="delete-prompt">
-                        Delete this thought?
-                      </span>
+                      </div>
+                    )}
+                    {voiceEditUndo?.paragraphIndex === activeParagraphIndex && (
                       <button
-                        className="text-button"
+                        className="text-button voice-edit-undo"
                         type="button"
-                        onClick={() => setConfirmingDelete(false)}
+                        onClick={undoVoiceEdit}
                       >
-                        Keep
+                        Undo last change
                       </button>
-                      <button
-                        className="text-button danger"
-                        type="button"
-                        onClick={() => {
-                          const updated = { ...notes }
-                          delete updated[activeParagraphIndex]
-                          persistNotes(updated)
-                          const updatedReviews = { ...transcriptReviews }
-                          delete updatedReviews[activeParagraphIndex]
-                          persistTranscriptReviews(updatedReviews)
-                          setOpenCorrection(null)
-                          setNoteDraft('')
-                          setConfirmingDelete(false)
-                        }}
-                      >
-                        Delete
-                      </button>
-                    </>
-                  ) : (
-                    <>
+                    )}
+                    <div className="voice-edit-actions">
                       <button
                         className="text-button"
                         type="button"
                         onClick={() => {
-                          setIsVoiceEditing(true)
+                          setNoteDraft(activeNote)
+                          setIsVoiceEditing(false)
                           setVoiceEditSelection(null)
                           setIsExtendingSelection(false)
-                          setVoiceEditUndo(null)
-                          setOpenCorrection(null)
                         }}
                       >
-                        Edit by voice
+                        Done
                       </button>
                       <button
                         className="text-button text-button-subtle"
                         type="button"
                         onClick={() => {
                           setNoteDraft(activeNote)
+                          setIsVoiceEditing(false)
+                          setVoiceEditSelection(null)
                           setIsEditingNote(true)
                         }}
                       >
                         Edit with keyboard
                       </button>
-                      <button
-                        className="text-button danger"
-                        type="button"
-                        onClick={() => setConfirmingDelete(true)}
-                      >
-                        Delete
-                      </button>
-                    </>
+                    </div>
+                  </div>
+                )}
+                {!isVoiceEditing &&
+                  activeReview &&
+                  openCorrection &&
+                  activeCorrectionSegment && (
+                    <div className="correction-panel">
+                      <div className="correction-panel-header">
+                        <div>
+                          <p className="correction-label">A DIFFERENT TAKE</p>
+                          <p className="correction-hint">
+                            Tap a version that sounds like what you said.
+                          </p>
+                        </div>
+                        <button
+                          className="text-button"
+                          type="button"
+                          onClick={() => setOpenCorrection(null)}
+                          aria-label="Close word suggestions"
+                        >
+                          Done
+                        </button>
+                      </div>
+                      <div className="correction-options">
+                        {activeCorrectionSegment.alternatives
+                          .filter(
+                            (alternative) =>
+                              alternative !== activeCorrectionSegment.selected,
+                          )
+                          .map((alternative) => (
+                            <button
+                              className="correction-option"
+                              type="button"
+                              key={alternative}
+                              onClick={() =>
+                                chooseAlternative(
+                                  openCorrection.segmentIndex,
+                                  alternative,
+                                )
+                              }
+                            >
+                              {alternative}
+                            </button>
+                          ))}
+                      </div>
+                    </div>
                   )}
-                </div>
-              )}
-            </div>
-          ) : isEditingNote ? (
-            <form
-              className="note-composer"
-              onSubmit={(event) => {
-                event.preventDefault()
-                const text = noteDraft.trim()
-                if (text && activeParagraphIndex !== null) {
-                  persistNotes({
-                    ...notes,
-                    [activeParagraphIndex]: text,
-                  })
-                  const updatedReviews = { ...transcriptReviews }
-                  delete updatedReviews[activeParagraphIndex]
-                  persistTranscriptReviews(updatedReviews)
-                  setOpenCorrection(null)
-                  setNoteDraft(text)
-                  setIsEditingNote(false)
-                }
-              }}
-            >
-              <div className="note-composer-header">
-                <label className="composer-label" htmlFor="note-draft">
-                  <span className="composer-pencil" aria-hidden="true">
-                    ✎
-                  </span>
-                  EDIT YOUR THOUGHT
-                </label>
-                <button
-                  className="text-button"
-                  type="button"
-                  onClick={() => {
-                    setNoteDraft(activeNote ?? '')
+                {!isVoiceEditing && (
+                  <div className="note-actions">
+                    {confirmingDelete ? (
+                      <>
+                        <span className="delete-prompt">
+                          Delete this thought?
+                        </span>
+                        <button
+                          className="text-button"
+                          type="button"
+                          onClick={() => setConfirmingDelete(false)}
+                        >
+                          Keep
+                        </button>
+                        <button
+                          className="text-button danger"
+                          type="button"
+                          onClick={() => {
+                            const updated = { ...notes }
+                            delete updated[activeParagraphIndex]
+                            persistNotes(updated)
+                            const updatedReviews = { ...transcriptReviews }
+                            delete updatedReviews[activeParagraphIndex]
+                            persistTranscriptReviews(updatedReviews)
+                            setOpenCorrection(null)
+                            setNoteDraft('')
+                            setConfirmingDelete(false)
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          className="text-button"
+                          type="button"
+                          onClick={() => {
+                            setIsVoiceEditing(true)
+                            setVoiceEditSelection(null)
+                            setIsExtendingSelection(false)
+                            setVoiceEditUndo(null)
+                            setOpenCorrection(null)
+                          }}
+                        >
+                          Edit by voice
+                        </button>
+                        <button
+                          className="text-button text-button-subtle"
+                          type="button"
+                          onClick={() => {
+                            setNoteDraft(activeNote)
+                            setIsEditingNote(true)
+                          }}
+                        >
+                          Edit with keyboard
+                        </button>
+                        <button
+                          className="text-button danger"
+                          type="button"
+                          onClick={() => setConfirmingDelete(true)}
+                        >
+                          Delete
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            ) : isEditingNote ? (
+              <form
+                className="note-composer"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  const text = noteDraft.trim()
+                  if (text && activeParagraphIndex !== null) {
+                    persistNotes({
+                      ...notes,
+                      [activeParagraphIndex]: text,
+                    })
+                    const updatedReviews = { ...transcriptReviews }
+                    delete updatedReviews[activeParagraphIndex]
+                    persistTranscriptReviews(updatedReviews)
+                    setOpenCorrection(null)
+                    setNoteDraft(text)
                     setIsEditingNote(false)
-                  }}
-                >
-                  Cancel
-                </button>
-              </div>
-              <p className="composer-guidance">
-                Keep the words that still sound like you. Your note changes only
-                when you save.
-              </p>
-              <textarea
-                id="note-draft"
-                autoFocus
-                value={noteDraft}
-                onChange={(event) => setNoteDraft(event.target.value)}
-                placeholder="What did this passage make you think?"
-                rows={5}
-              />
-              <div className="composer-footer">
-                <p className="storage-note">
-                  {storageWarning
-                    ? 'Browser storage is unavailable.'
-                    : 'This stays in your browser.'}
+                  }
+                }}
+              >
+                <div className="note-composer-header">
+                  <label className="composer-label" htmlFor="note-draft">
+                    <span className="composer-pencil" aria-hidden="true">
+                      ✎
+                    </span>
+                    EDIT YOUR THOUGHT
+                  </label>
+                  <button
+                    className="text-button"
+                    type="button"
+                    onClick={() => {
+                      setNoteDraft(activeNote ?? '')
+                      setIsEditingNote(false)
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+                <p className="composer-guidance">
+                  Keep the words that still sound like you. Your note changes
+                  only when you save.
                 </p>
-                <button
-                  className="save-note"
-                  type="submit"
-                  disabled={!noteDraft.trim()}
-                >
-                  Save changes <span aria-hidden="true">↗</span>
-                </button>
-              </div>
-            </form>
-          ) : (
-            <button
-              className="add-note"
-              type="button"
-              onClick={() => {
-                setNoteDraft('')
-                setIsEditingNote(true)
-              }}
-            >
-              <span aria-hidden="true">✎</span> Leave a thought
-            </button>
-          )}
-          <p className="rail-footnote">
-            Notes stay with their passage on this device.
-          </p>
-        </aside>
-      </main>
+                <textarea
+                  id="note-draft"
+                  autoFocus
+                  value={noteDraft}
+                  onChange={(event) => setNoteDraft(event.target.value)}
+                  placeholder="What did this passage make you think?"
+                  rows={5}
+                />
+                <div className="composer-footer">
+                  <p className="storage-note">
+                    {storageWarning
+                      ? 'Browser storage is unavailable.'
+                      : 'This stays in your browser.'}
+                  </p>
+                  <button
+                    className="save-note"
+                    type="submit"
+                    disabled={!noteDraft.trim()}
+                  >
+                    Save changes <span aria-hidden="true">↗</span>
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <button
+                className="add-note"
+                type="button"
+                onClick={() => {
+                  setNoteDraft('')
+                  setIsEditingNote(true)
+                }}
+              >
+                <span aria-hidden="true">✎</span> Leave a thought
+              </button>
+            )}
+            <p className="rail-footnote">
+              Notes stay with their passage on this device.
+            </p>
+          </aside>
+        </main>
 
-      <div className="keyboard-hint" aria-hidden="true">
-        <span className="keyboard-key">SPACE</span>
-        <span>
-          {activeParagraphIndex === null
-            ? 'select a passage first'
-            : isVoiceEditing
-              ? voiceEditSelection
-                ? 'hold to replace selected words'
-                : 'tap a word to begin editing'
-              : voiceState === 'recording'
-                ? 'release to finish thought'
-                : 'hold to speak'}
-        </span>
+        <div className="keyboard-hint" aria-hidden="true">
+          <span className="keyboard-key">SPACE</span>
+          <span>
+            {activeParagraphIndex === null
+              ? 'select a passage first'
+              : isVoiceEditing
+                ? voiceEditSelection
+                  ? 'hold to replace selected words'
+                  : 'tap a word to begin editing'
+                : voiceState === 'recording'
+                  ? 'release to finish thought'
+                  : 'hold to speak'}
+          </span>
+        </div>
+
+        <button
+          type="button"
+          className="mobile-margin-toggle"
+          aria-expanded={marginOpen}
+          aria-controls="margin-notes"
+          onClick={() => setMarginOpen(!marginOpen)}
+        >
+          {marginOpen ? 'Close thoughts' : 'Open your margin'}{' '}
+          <span aria-hidden="true">↗</span>
+        </button>
       </div>
 
       {isSettingsOpen && (
