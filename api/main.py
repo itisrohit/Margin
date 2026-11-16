@@ -3,7 +3,7 @@ import io
 import queue
 import wave
 from collections.abc import Iterator
-from typing import TypedDict
+from typing import Any, TypedDict
 
 import grpc
 import riva.client
@@ -59,7 +59,33 @@ SPEECH_MODELS: dict[str, SpeechModel] = {
 MAX_AUDIO_BYTES = 6_000_000
 
 
-def transcribe_pcm(audio: bytes, api_key: str, model_id: str) -> str:
+def serialize_result(result: Any) -> dict[str, object]:
+    alternatives = list(
+        dict.fromkeys(
+            alternative.transcript.strip()
+            for alternative in result.alternatives
+            if alternative.transcript.strip()
+        )
+    )
+    top_alternative = result.alternatives[0]
+    return {
+        "text": top_alternative.transcript.strip(),
+        "alternatives": alternatives,
+        "words": [
+            {
+                "text": word.word,
+                "start": word.start_time,
+                "end": word.end_time,
+                "confidence": word.confidence,
+            }
+            for word in top_alternative.words
+        ],
+    }
+
+
+def transcribe_pcm(
+    audio: bytes, api_key: str, model_id: str, correction_mode: bool = False
+) -> dict[str, object]:
     model = SPEECH_MODELS[model_id]
     auth = riva.client.Auth(
         use_ssl=True,
@@ -76,8 +102,9 @@ def transcribe_pcm(audio: bytes, api_key: str, model_id: str) -> str:
         audio_channel_count=1,
         language_code="en-US",
         model=model_id,
-        max_alternatives=1,
-        enable_automatic_punctuation=True,
+        max_alternatives=3,
+        enable_automatic_punctuation=not correction_mode,
+        enable_word_time_offsets=True,
     )
 
     try:
@@ -93,20 +120,18 @@ def transcribe_pcm(audio: bytes, api_key: str, model_id: str) -> str:
                 audio_chunks=audio_chunks,
                 streaming_config=streaming_config,
             )
-            transcript_parts = [
-                result.alternatives[0].transcript
+            results = [
+                result
                 for response in responses
                 for result in getattr(response, "results", [])
                 if result.is_final and result.alternatives
             ]
         else:
             response = service.offline_recognize(audio, config)
-            transcript_parts = [
-                result.alternatives[0].transcript
-                for result in getattr(response, "results", [])
-                if result.alternatives
-            ]
-        return " ".join(part.strip() for part in transcript_parts).strip()
+            results = [result for result in getattr(response, "results", []) if result.alternatives]
+        segments = [serialize_result(result) for result in results]
+        transcript = " ".join(str(segment["text"]) for segment in segments).strip()
+        return {"text": transcript, "segments": segments}
     finally:
         auth.channel.close()
 
@@ -117,6 +142,7 @@ def stream_transcription(
     model_id: str,
     loop: asyncio.AbstractEventLoop,
     websocket: WebSocket,
+    correction_mode: bool,
 ) -> None:
     """Forward live PCM to Riva and stream cumulative transcript updates to the browser."""
     model = SPEECH_MODELS[model_id]
@@ -135,8 +161,9 @@ def stream_transcription(
         audio_channel_count=1,
         language_code="en-US",
         model=model_id,
-        max_alternatives=1,
-        enable_automatic_punctuation=True,
+        max_alternatives=3,
+        enable_automatic_punctuation=not correction_mode,
+        enable_word_time_offsets=True,
     )
     streaming_config = riva.client.StreamingRecognitionConfig(
         config=config,
@@ -147,7 +174,7 @@ def stream_transcription(
         while (chunk := audio_queue.get()) is not None:
             yield chunk
 
-    final_parts: list[str] = []
+    final_segments: list[dict[str, object]] = []
     try:
         responses = service.streaming_response_generator(
             audio_chunks=audio_chunks(),
@@ -161,18 +188,20 @@ def stream_transcription(
                 text = result.alternatives[0].transcript.strip()
                 if result.is_final:
                     if text:
-                        final_parts.append(text)
+                        final_segments.append(serialize_result(result))
                 else:
                     interim = text
+            final_parts = [str(segment["text"]) for segment in final_segments]
             cumulative = " ".join(final_parts + ([interim] if interim else [])).strip()
             if cumulative:
                 asyncio.run_coroutine_threadsafe(
                     websocket.send_json({"type": "transcript", "text": cumulative}),
                     loop,
                 ).result()
-        final_text = " ".join(final_parts).strip()
+        final_text = " ".join(str(segment["text"]) for segment in final_segments).strip()
         asyncio.run_coroutine_threadsafe(
-            websocket.send_json({"type": "done", "text": final_text}), loop
+            websocket.send_json({"type": "done", "text": final_text, "segments": final_segments}),
+            loop,
         ).result()
     except grpc.RpcError as error:
         detail = (
@@ -197,7 +226,8 @@ async def transcribe_speech(
     request: Request,
     authorization: str | None = Header(default=None),
     x_speech_model: str | None = Header(default=None),
-) -> dict[str, str]:
+    x_speech_correction: bool = Header(default=False),
+) -> dict[str, object]:
     api_key = authorization.removeprefix("Bearer ").strip() if authorization else ""
     if not api_key:
         raise HTTPException(status_code=401, detail="Add an NVIDIA NIM API key in Settings.")
@@ -232,7 +262,9 @@ async def transcribe_speech(
         raise HTTPException(status_code=422, detail="The recording was empty.")
 
     try:
-        transcript = await run_in_threadpool(transcribe_pcm, audio, api_key, x_speech_model)
+        transcription = await run_in_threadpool(
+            transcribe_pcm, audio, api_key, x_speech_model, x_speech_correction
+        )
     except grpc.RpcError as error:
         if getattr(error, "code", lambda: None)() == grpc.StatusCode.PERMISSION_DENIED:
             raise HTTPException(
@@ -241,7 +273,7 @@ async def transcribe_speech(
             ) from error
         raise HTTPException(status_code=502, detail="NVIDIA transcription failed.") from error
 
-    return {"text": transcript, "model_id": x_speech_model}
+    return {**transcription, "model_id": x_speech_model}
 
 
 @app.websocket("/speech/stream")
@@ -251,6 +283,7 @@ async def stream_speech(websocket: WebSocket) -> None:
         credentials = await websocket.receive_json()
         api_key = credentials.get("apiKey", "").strip()
         model_id = credentials.get("modelId", "")
+        correction_mode = credentials.get("correctionMode") is True
         if not api_key or model_id not in SPEECH_MODELS or not SPEECH_MODELS[model_id]["streaming"]:
             await websocket.send_json(
                 {
@@ -264,7 +297,15 @@ async def stream_speech(websocket: WebSocket) -> None:
         audio_queue: queue.Queue[bytes | None] = queue.Queue()
         loop = asyncio.get_running_loop()
         worker = asyncio.create_task(
-            run_in_threadpool(stream_transcription, audio_queue, api_key, model_id, loop, websocket)
+            run_in_threadpool(
+                stream_transcription,
+                audio_queue,
+                api_key,
+                model_id,
+                loop,
+                websocket,
+                correction_mode,
+            )
         )
         try:
             while True:

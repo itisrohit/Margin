@@ -499,10 +499,11 @@
 .note-composer {
   margin-top: 18px;
   padding: 18px;
-  border: 1px solid #e7dfd2;
-  border-radius: 7px;
-  background: #fffdf8;
-  box-shadow: 0 10px 28px rgba(53, 48, 36, 0.045);
+  border: 1px solid #e9dfcb;
+  border-left: 3px solid #d9ad96;
+  border-radius: 4px 7px 7px 4px;
+  background: #f4f0e5;
+  box-shadow: 0 8px 20px rgba(53, 48, 36, 0.035);
 }
 
 .composer-label,
@@ -519,6 +520,13 @@
   display: flex;
   align-items: center;
   gap: 7px;
+}
+
+.composer-guidance {
+  margin: 11px 0 10px;
+  color: #9a9589;
+  font-size: 9px;
+  line-height: 1.5;
 }
 
 .note-composer-header {
@@ -546,11 +554,11 @@
   resize: vertical;
   border: 0;
   outline: none;
-  color: var(--ink);
+  color: #554c3b;
   background: transparent;
-  font-family: var(--serif);
-  font-size: 17px;
-  line-height: 1.65;
+  font-family: 'Bradley Hand', 'Segoe Print', 'Comic Sans MS', cursive;
+  font-size: 18px;
+  line-height: 1.5;
 }
 
 .note-composer textarea::placeholder {
@@ -671,6 +679,173 @@
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.review-note-hint {
+  margin: 12px 0 -5px;
+  color: #918a79;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.voice-edit-text {
+  user-select: none;
+}
+
+.voice-edit-word {
+  margin: 0;
+  padding: 0 1px;
+  border: 0;
+  border-bottom: 1px dotted rgba(165, 150, 119, 0.45);
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
+.voice-edit-word:hover,
+.voice-edit-word:focus-visible {
+  color: var(--accent);
+}
+
+.voice-edit-word:focus-visible {
+  border-radius: 3px;
+  outline: 2px solid rgba(186, 105, 76, 0.32);
+  outline-offset: 2px;
+}
+
+.voice-edit-word.is-selected {
+  border-bottom: 2px solid var(--accent);
+  border-radius: 2px;
+  color: #8d4c3c;
+  background: rgba(186, 105, 76, 0.12);
+}
+
+.voice-edit-panel {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(165, 150, 119, 0.2);
+}
+
+.voice-edit-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.voice-edit-panel-header .correction-label {
+  margin: 0;
+}
+
+.voice-edit-panel-header .text-button.is-active {
+  color: var(--accent);
+}
+
+.voice-edit-undo {
+  margin-top: 10px;
+  color: var(--accent);
+}
+
+.voice-edit-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 13px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(165, 150, 119, 0.16);
+}
+
+.transcript-word {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+}
+
+.transcript-word.has-alternatives {
+  border-bottom: 1px dashed rgba(186, 105, 76, 0.72);
+  cursor: pointer;
+}
+
+.transcript-word.has-alternatives:hover,
+.transcript-word.has-alternatives:focus-visible {
+  color: var(--accent);
+}
+
+.transcript-word.has-alternatives:focus-visible {
+  border-radius: 2px;
+  outline: 2px solid rgba(186, 105, 76, 0.32);
+  outline-offset: 2px;
+}
+
+.correction-panel {
+  margin-top: 16px;
+  padding: 13px 12px;
+  border: 1px solid rgba(165, 150, 119, 0.24);
+  border-radius: 5px;
+  background: rgba(255, 253, 248, 0.52);
+}
+
+.correction-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.correction-label {
+  margin: 0 0 4px;
+  color: #888477;
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+}
+
+.correction-hint {
+  margin: 0;
+  color: #9a9589;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.correction-options {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.correction-option {
+  padding: 8px 9px;
+  border: 1px solid rgba(165, 150, 119, 0.22);
+  border-radius: 4px;
+  color: #554c3b;
+  background: rgba(255, 253, 248, 0.7);
+  cursor: pointer;
+  font-family: var(--serif);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: left;
+  transition:
+    border-color 140ms ease,
+    background-color 140ms ease;
+}
+
+.correction-option:hover,
+.correction-option:focus-visible {
+  border-color: #cba18b;
+  background: #fffdf8;
+}
+
+.correction-option:focus-visible {
+  outline: 2px solid rgba(186, 105, 76, 0.4);
+  outline-offset: 2px;
+}
+
+.text-button-subtle {
+  color: #a49b87;
 }
 
 .note-actions {

@@ -3,6 +3,7 @@ import './App.css'
 
 const NOTES_STORAGE_KEY = 'margin:sample-essay:notes'
 const SPEECH_SETTINGS_KEY = 'margin:speech-settings'
+const SPEECH_REVIEW_KEY = 'margin:sample-essay:speech-review'
 
 const speechModels = [
   {
@@ -39,6 +40,38 @@ const speechModels = [
 
 type SpeechModelId = (typeof speechModels)[number]['id']
 type SpeechSettings = { apiKey: string; modelId: SpeechModelId }
+type TranscriptWord = {
+  text: string
+  start: number
+  end: number
+  confidence: number
+}
+type ServerTranscriptSegment = {
+  text: string
+  alternatives: string[]
+  words: TranscriptWord[]
+}
+type TranscriptSegment = {
+  text: string
+  selected: string
+  alternatives: string[]
+  words: TranscriptWord[]
+}
+type TranscriptReview = {
+  baseText: string
+  segments: TranscriptSegment[]
+}
+type VoiceEditSelection = {
+  start: number
+  end: number
+  anchorWord: number
+  focusWord: number
+}
+type VoiceEditUndo = {
+  paragraphIndex: number
+  note: string
+  review?: TranscriptReview
+}
 type LiveCapture = {
   socket: WebSocket
   stream: MediaStream
@@ -146,6 +179,230 @@ function loadSpeechSettings(): SpeechSettings {
   return { apiKey: '', modelId: DEFAULT_SPEECH_MODEL_ID }
 }
 
+function loadTranscriptReviews(): Record<number, TranscriptReview> {
+  try {
+    const stored = window.localStorage.getItem(SPEECH_REVIEW_KEY)
+    const parsed: unknown = stored ? JSON.parse(stored) : {}
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      return {}
+    }
+    return Object.fromEntries(
+      Object.entries(parsed).flatMap(([index, value]) => {
+        if (
+          !Number.isInteger(Number(index)) ||
+          Number(index) < 0 ||
+          Number(index) >= paragraphs.length ||
+          typeof value !== 'object' ||
+          value === null ||
+          !('baseText' in value) ||
+          typeof value.baseText !== 'string' ||
+          !('segments' in value) ||
+          !Array.isArray(value.segments)
+        ) {
+          return []
+        }
+        const segments = value.segments.filter(
+          (segment: unknown): segment is TranscriptSegment =>
+            typeof segment === 'object' &&
+            segment !== null &&
+            'text' in segment &&
+            typeof segment.text === 'string' &&
+            'selected' in segment &&
+            typeof segment.selected === 'string' &&
+            'alternatives' in segment &&
+            Array.isArray(segment.alternatives) &&
+            segment.alternatives.every(
+              (alternative: unknown) => typeof alternative === 'string',
+            ) &&
+            'words' in segment &&
+            Array.isArray(segment.words) &&
+            segment.words.every(
+              (word: unknown) =>
+                typeof word === 'object' &&
+                word !== null &&
+                'text' in word &&
+                typeof word.text === 'string' &&
+                'start' in word &&
+                typeof word.start === 'number' &&
+                'end' in word &&
+                typeof word.end === 'number' &&
+                'confidence' in word &&
+                typeof word.confidence === 'number',
+            ),
+        )
+        return [[Number(index), { baseText: value.baseText, segments }]]
+      }),
+    )
+  } catch {
+    return {}
+  }
+}
+
+function normalizeToken(token: string): string {
+  return token
+    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '')
+    .toLocaleLowerCase()
+}
+
+function alignedAlternativeToken(
+  currentTokens: string[],
+  alternativeTokens: string[],
+  targetIndex: number,
+): string | undefined {
+  const rows = currentTokens.length + 1
+  const columns = alternativeTokens.length + 1
+  const costs = Array.from({ length: rows }, () =>
+    Array<number>(columns).fill(0),
+  )
+  for (let row = 0; row < rows; row += 1) costs[row][0] = row
+  for (let column = 0; column < columns; column += 1) costs[0][column] = column
+  for (let row = 1; row < rows; row += 1) {
+    for (let column = 1; column < columns; column += 1) {
+      const substitution =
+        normalizeToken(currentTokens[row - 1]) ===
+        normalizeToken(alternativeTokens[column - 1])
+          ? 0
+          : 1
+      costs[row][column] = Math.min(
+        costs[row - 1][column] + 1,
+        costs[row][column - 1] + 1,
+        costs[row - 1][column - 1] + substitution,
+      )
+    }
+  }
+
+  let row = currentTokens.length
+  let column = alternativeTokens.length
+  while (row > 0 || column > 0) {
+    if (
+      row > 0 &&
+      column > 0 &&
+      costs[row][column] ===
+        costs[row - 1][column - 1] +
+          (normalizeToken(currentTokens[row - 1]) ===
+          normalizeToken(alternativeTokens[column - 1])
+            ? 0
+            : 1)
+    ) {
+      if (row - 1 === targetIndex) {
+        return alternativeTokens[column - 1]
+      }
+      row -= 1
+      column -= 1
+    } else if (row > 0 && costs[row][column] === costs[row - 1][column] + 1) {
+      if (row - 1 === targetIndex) return undefined
+      row -= 1
+    } else {
+      column -= 1
+    }
+  }
+  return undefined
+}
+
+function tokenAlternatives(
+  segment: TranscriptSegment,
+  tokenIndex: number,
+): string[] {
+  const currentTokens = segment.selected.split(/\s+/u)
+  const current = currentTokens[tokenIndex]
+  if (!current) return []
+  return Array.from(
+    new Set(
+      segment.alternatives
+        .map((alternative) =>
+          alignedAlternativeToken(
+            currentTokens,
+            alternative.split(/\s+/u),
+            tokenIndex,
+          ),
+        )
+        .filter((token): token is string => Boolean(token))
+        .filter((token) => normalizeToken(token) !== normalizeToken(current)),
+    ),
+  )
+}
+
+function prepareReviewSegments(
+  segments: ServerTranscriptSegment[],
+): TranscriptSegment[] {
+  return segments.map((segment) => ({
+    text: segment.text,
+    selected: segment.text,
+    alternatives: Array.from(
+      new Set(
+        segment.alternatives
+          .map((alternative) => alternative.trim())
+          .filter(Boolean),
+      ),
+    ),
+    words: segment.words ?? [],
+  }))
+}
+
+function noteWordRanges(
+  text: string,
+): Array<{ text: string; start: number; end: number }> {
+  return Array.from(text.matchAll(/\S+/gu), (match) => ({
+    text: match[0],
+    start: match.index,
+    end: match.index + match[0].length,
+  }))
+}
+
+function replaceTextRange(
+  text: string,
+  start: number,
+  end: number,
+  replacement: string,
+): string {
+  const before = text.slice(0, start)
+  const selected = text.slice(start, end)
+  const after = text.slice(end)
+  let spoken = replacement.trim().replace(/\s+/gu, ' ')
+  const sentenceEnd = /[.!?…]["'’”)}\]]*$/u
+  const originalEnding = selected.match(sentenceEnd)?.[0] ?? ''
+
+  // Recognition punctuation belongs to the sentence context, not the spoken
+  // fragment. Keep the original boundary punctuation and avoid inserting a
+  // sentence break in the middle of the note.
+  if (after.trim() && !originalEnding) {
+    spoken = spoken.replace(sentenceEnd, '')
+  } else if (originalEnding) {
+    spoken = spoken.replace(sentenceEnd, '') + originalEnding
+  }
+
+  const nextText =
+    after && originalEnding ? capitalizeSentenceStart(after) : after
+  return `${before}${spoken}${nextText}`
+}
+
+function locateReviewRange(
+  review: TranscriptReview,
+  start: number,
+  end: number,
+): { segmentIndex: number; localStart: number; localEnd: number } | null {
+  const fullTranscript = appendTranscript(
+    review.baseText,
+    review.segments.map((segment) => segment.selected).join(' '),
+  )
+  let searchFrom = review.baseText.length
+  for (const [segmentIndex, segment] of review.segments.entries()) {
+    const segmentStart = fullTranscript.indexOf(segment.selected, searchFrom)
+    if (segmentStart < 0) continue
+    const localStart = start - segmentStart
+    const localEnd = end - segmentStart
+    if (localStart >= 0 && localEnd <= segment.selected.length) {
+      return { segmentIndex, localStart, localEnd }
+    }
+    searchFrom = segmentStart + segment.selected.length
+  }
+  return null
+}
+
 const paragraphs = [
   'We tend to treat a thought as a thing that arrives finished. It appears, clear and self-contained, and we decide whether to keep it or let it go. But most ideas begin less like sentences and more like weather: a change in pressure, a small disturbance at the edge of attention.',
   'Reading gives those unfinished thoughts somewhere to land. A line in an essay can meet an experience we have not yet put into words. For a moment, the page and our own memory seem to be talking about the same thing.',
@@ -195,6 +452,18 @@ function App() {
     number | null
   >(null)
   const [notes, setNotes] = useState<Record<number, string>>(loadNotes)
+  const [transcriptReviews, setTranscriptReviews] = useState<
+    Record<number, TranscriptReview>
+  >(loadTranscriptReviews)
+  const [openCorrection, setOpenCorrection] = useState<{
+    segmentIndex: number
+    wordIndex: number
+  } | null>(null)
+  const [isVoiceEditing, setIsVoiceEditing] = useState(false)
+  const [voiceEditSelection, setVoiceEditSelection] =
+    useState<VoiceEditSelection | null>(null)
+  const [isExtendingSelection, setIsExtendingSelection] = useState(false)
+  const [voiceEditUndo, setVoiceEditUndo] = useState<VoiceEditUndo | null>(null)
   const [noteDraft, setNoteDraft] = useState('')
   const [isEditingNote, setIsEditingNote] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
@@ -223,6 +492,10 @@ function App() {
     focusedParagraphIndex === null ? null : paragraphs[focusedParagraphIndex]
   const activeNote =
     activeParagraphIndex === null ? undefined : notes[activeParagraphIndex]
+  const activeReview =
+    activeParagraphIndex === null
+      ? undefined
+      : transcriptReviews[activeParagraphIndex]
 
   const persistNotes = useCallback((updatedNotes: Record<number, string>) => {
     setNotes(updatedNotes)
@@ -237,15 +510,316 @@ function App() {
     }
   }, [])
 
+  const persistTranscriptReviews = useCallback(
+    (updatedReviews: Record<number, TranscriptReview>) => {
+      setTranscriptReviews(updatedReviews)
+      try {
+        window.localStorage.setItem(
+          SPEECH_REVIEW_KEY,
+          JSON.stringify(updatedReviews),
+        )
+      } catch {
+        setStorageWarning(true)
+      }
+    },
+    [],
+  )
+
+  const chooseAlternative = (segmentIndex: number, alternative: string) => {
+    if (activeParagraphIndex === null) return
+    const review = transcriptReviews[activeParagraphIndex]
+    if (!review) return
+    const segments = review.segments.map((segment, index) =>
+      index === segmentIndex ? { ...segment, selected: alternative } : segment,
+    )
+    const updatedReview = { ...review, segments }
+    const transcript = segments.map((segment) => segment.selected).join(' ')
+    const updatedNote = appendTranscript(review.baseText, transcript)
+    persistNotes({ ...notes, [activeParagraphIndex]: updatedNote })
+    setNoteDraft(updatedNote)
+    persistTranscriptReviews({
+      ...transcriptReviews,
+      [activeParagraphIndex]: updatedReview,
+    })
+    setOpenCorrection(null)
+  }
+
+  const renderTranscript = (review: TranscriptReview) => (
+    <div className="saved-note-text">
+      {review.baseText && <span>{review.baseText} </span>}
+      {review.segments.map((segment, segmentIndex) => {
+        const words =
+          segment.selected === segment.text && segment.words.length
+            ? segment.words.map((word) => word.text)
+            : segment.selected.split(/\s+/u)
+        return (
+          <span key={`${segmentIndex}-${segment.text}`}>
+            {segmentIndex > 0 && ' '}
+            {words.map((word, wordIndex) => {
+              const alternatives = tokenAlternatives(segment, wordIndex)
+              return (
+                <span key={`${wordIndex}-${word}`}>
+                  {wordIndex > 0 && ' '}
+                  {alternatives.length ? (
+                    <button
+                      className="transcript-word has-alternatives"
+                      type="button"
+                      aria-label={`Review the transcription of ${word}`}
+                      onClick={() =>
+                        setOpenCorrection({ segmentIndex, wordIndex })
+                      }
+                    >
+                      {word}
+                    </button>
+                  ) : (
+                    word
+                  )}
+                </span>
+              )
+            })}
+          </span>
+        )
+      })}
+    </div>
+  )
+
+  const activeCorrectionSegment =
+    openCorrection && activeReview
+      ? activeReview.segments[openCorrection.segmentIndex]
+      : undefined
+  const voiceEditReviewLocation =
+    voiceEditSelection && activeReview
+      ? locateReviewRange(
+          activeReview,
+          voiceEditSelection.start,
+          voiceEditSelection.end,
+        )
+      : null
+  const voiceEditReviewSegment = voiceEditReviewLocation
+    ? activeReview?.segments[voiceEditReviewLocation.segmentIndex]
+    : undefined
+  const voiceEditSegmentWordIndex = voiceEditReviewSegment
+    ? noteWordRanges(voiceEditReviewSegment.selected).findIndex(
+        (word) =>
+          word.start < voiceEditReviewLocation!.localEnd &&
+          word.end > voiceEditReviewLocation!.localStart,
+      )
+    : -1
+  const voiceEditAlternatives =
+    voiceEditReviewSegment &&
+    voiceEditSegmentWordIndex >= 0 &&
+    voiceEditSelection &&
+    activeNote
+      ?.slice(voiceEditSelection.start, voiceEditSelection.end)
+      .trim()
+      .split(/\s+/u).length === 1
+      ? tokenAlternatives(voiceEditReviewSegment, voiceEditSegmentWordIndex)
+      : []
+
   const selectParagraph = (index: number) => {
     setActiveParagraphIndex(index)
     setNoteDraft(notes[index] ?? '')
     setIsEditingNote(false)
     setConfirmingDelete(false)
+    setOpenCorrection(null)
+    setIsVoiceEditing(false)
+    setVoiceEditSelection(null)
+    setVoiceEditUndo(null)
+  }
+
+  const selectVoiceWord = (wordIndex: number, extend = false) => {
+    const ranges = noteWordRanges(activeNote ?? '')
+    const range = ranges[wordIndex]
+    if (!range) return
+    const current = voiceEditSelection
+    const shouldExtend = extend || isExtendingSelection
+    const anchorWord = shouldExtend && current ? current.anchorWord : wordIndex
+    const firstWord = ranges[Math.min(anchorWord, wordIndex)]
+    const lastWord = ranges[Math.max(anchorWord, wordIndex)]
+    setVoiceEditSelection({
+      start: firstWord.start,
+      end: lastWord.end,
+      anchorWord,
+      focusWord: wordIndex,
+    })
+    setOpenCorrection(null)
+    if (shouldExtend && current) setIsExtendingSelection(false)
+  }
+
+  const renderVoiceEditWords = (text: string) => (
+    <div className="saved-note-text voice-edit-text">
+      {noteWordRanges(text).map((word, index) => (
+        <span key={`${word.start}-${word.text}`}>
+          {index > 0 && ' '}
+          <button
+            className={`voice-edit-word${
+              voiceEditSelection &&
+              word.start >= voiceEditSelection.start &&
+              word.end <= voiceEditSelection.end
+                ? ' is-selected'
+                : ''
+            }`}
+            id={`voice-edit-word-${index}`}
+            type="button"
+            aria-pressed={Boolean(
+              voiceEditSelection &&
+              word.start >= voiceEditSelection.start &&
+              word.end <= voiceEditSelection.end,
+            )}
+            onClick={(event) => selectVoiceWord(index, event.shiftKey)}
+            onKeyDown={(event) => {
+              if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')
+                return
+              const nextIndex = index + (event.key === 'ArrowRight' ? 1 : -1)
+              if (nextIndex < 0 || nextIndex >= noteWordRanges(text).length)
+                return
+              event.preventDefault()
+              selectVoiceWord(nextIndex, event.shiftKey)
+              document.getElementById(`voice-edit-word-${nextIndex}`)?.focus()
+            }}
+          >
+            {word.text}
+          </button>
+        </span>
+      ))}
+    </div>
+  )
+
+  const applyVoiceEditReplacement = useCallback(
+    (replacement: string) => {
+      if (activeParagraphIndex === null || !activeNote || !voiceEditSelection) {
+        return
+      }
+      const paragraphIndex = activeParagraphIndex
+      const previousReview = transcriptReviews[paragraphIndex]
+      let updatedNote = replaceTextRange(
+        activeNote,
+        voiceEditSelection.start,
+        voiceEditSelection.end,
+        replacement,
+      )
+      let updatedReview: TranscriptReview | undefined
+
+      if (previousReview) {
+        const location = locateReviewRange(
+          previousReview,
+          voiceEditSelection.start,
+          voiceEditSelection.end,
+        )
+        if (location) {
+          const segment = previousReview.segments[location.segmentIndex]
+          const oldWordRanges = noteWordRanges(segment.selected)
+          const firstWordIndex = oldWordRanges.findIndex(
+            (word) => word.end > location.localStart,
+          )
+          const lastWordIndex = oldWordRanges.findLastIndex(
+            (word) => word.start < location.localEnd,
+          )
+          const replacementWords = replacement
+            .trim()
+            .split(/\s+/u)
+            .filter(Boolean)
+          let words = segment.words
+          if (firstWordIndex >= 0 && lastWordIndex >= firstWordIndex) {
+            const timingWords = segment.words.slice(
+              firstWordIndex,
+              lastWordIndex + 1,
+            )
+            const fallbackTiming = timingWords[0]
+            const replacementMetadata = replacementWords.map((text, index) => {
+              const timing =
+                timingWords[Math.min(index, timingWords.length - 1)] ??
+                fallbackTiming
+              return {
+                text,
+                start: timing?.start ?? 0,
+                end: timing?.end ?? 0,
+                confidence: timing?.confidence ?? 0,
+              }
+            })
+            words = [
+              ...segment.words.slice(0, firstWordIndex),
+              ...replacementMetadata,
+              ...segment.words.slice(lastWordIndex + 1),
+            ]
+          }
+          const selected = replaceTextRange(
+            segment.selected,
+            location.localStart,
+            location.localEnd,
+            replacement,
+          )
+          const segments = previousReview.segments.map((item, index) =>
+            index === location.segmentIndex
+              ? {
+                  ...item,
+                  selected,
+                  alternatives: Array.from(
+                    new Set([...item.alternatives, selected]),
+                  ),
+                  words,
+                }
+              : item,
+          )
+          updatedReview = { ...previousReview, segments }
+          updatedNote = appendTranscript(
+            updatedReview.baseText,
+            segments.map((item) => item.selected).join(' '),
+          )
+        }
+      }
+
+      setVoiceEditUndo({
+        paragraphIndex,
+        note: activeNote,
+        review: previousReview,
+      })
+      persistNotes({ ...notes, [paragraphIndex]: updatedNote })
+      setNoteDraft(updatedNote)
+      const reviews = { ...transcriptReviews }
+      if (updatedReview) reviews[paragraphIndex] = updatedReview
+      else delete reviews[paragraphIndex]
+      persistTranscriptReviews(reviews)
+      setVoiceEditSelection(null)
+      setIsExtendingSelection(false)
+      setOpenCorrection(null)
+    },
+    [
+      activeNote,
+      activeParagraphIndex,
+      notes,
+      persistNotes,
+      persistTranscriptReviews,
+      transcriptReviews,
+      voiceEditSelection,
+    ],
+  )
+
+  const undoVoiceEdit = () => {
+    if (
+      !voiceEditUndo ||
+      activeParagraphIndex !== voiceEditUndo.paragraphIndex
+    ) {
+      return
+    }
+    persistNotes({ ...notes, [activeParagraphIndex]: voiceEditUndo.note })
+    setNoteDraft(voiceEditUndo.note)
+    const reviews = { ...transcriptReviews }
+    if (voiceEditUndo.review)
+      reviews[activeParagraphIndex] = voiceEditUndo.review
+    else delete reviews[activeParagraphIndex]
+    persistTranscriptReviews(reviews)
+    setVoiceEditUndo(null)
+    setVoiceEditSelection(null)
   }
 
   const startVoiceCapture = useCallback(async () => {
     if (recorderRef.current || !voiceHoldRef.current) return
+    if (isVoiceEditing && !voiceEditSelection) {
+      setVoiceError('Tap a word first to choose what to replace.')
+      voiceHoldRef.current = false
+      return
+    }
     if (activeParagraphIndex === null) {
       setVoiceError('Select a passage before recording a thought.')
       setVoiceState('error')
@@ -262,8 +836,8 @@ function App() {
     const paragraphIndex = activeParagraphIndex
     let stream: MediaStream | null = null
     try {
-      if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-        throw new Error('This browser does not support microphone recording.')
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('This browser does not support microphone access.')
       }
       stream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1 },
@@ -322,21 +896,43 @@ function App() {
             type: 'transcript' | 'done' | 'error'
             text?: string
             detail?: string
+            segments?: ServerTranscriptSegment[]
           }
           if (result.type === 'transcript' && result.text) {
             capture.latestText = result.text
             setNoteDraft(
-              appendTranscript(notes[paragraphIndex] ?? '', result.text),
+              isVoiceEditing && voiceEditSelection
+                ? replaceTextRange(
+                    notes[paragraphIndex] ?? '',
+                    voiceEditSelection.start,
+                    voiceEditSelection.end,
+                    result.text,
+                  )
+                : appendTranscript(notes[paragraphIndex] ?? '', result.text),
             )
           } else if (result.type === 'done') {
             const transcript = (result.text || capture.latestText).trim()
             if (transcript) {
-              const updatedNote = appendTranscript(
-                notes[paragraphIndex] ?? '',
-                transcript,
-              )
-              persistNotes({ ...notes, [paragraphIndex]: updatedNote })
-              setNoteDraft(updatedNote)
+              if (isVoiceEditing && voiceEditSelection) {
+                applyVoiceEditReplacement(transcript)
+              } else {
+                const updatedNote = appendTranscript(
+                  notes[paragraphIndex] ?? '',
+                  transcript,
+                )
+                persistNotes({ ...notes, [paragraphIndex]: updatedNote })
+                setNoteDraft(updatedNote)
+                const segments = prepareReviewSegments(result.segments ?? [])
+                if (segments.length) {
+                  persistTranscriptReviews({
+                    ...transcriptReviews,
+                    [paragraphIndex]: {
+                      baseText: notes[paragraphIndex] ?? '',
+                      segments,
+                    },
+                  })
+                }
+              }
               setVoiceError('')
             } else {
               setVoiceError(
@@ -380,6 +976,7 @@ function App() {
           JSON.stringify({
             apiKey: speechSettings.apiKey,
             modelId: speechSettings.modelId,
+            correctionMode: isVoiceEditing,
           }),
         )
         processor.onaudioprocess = (event) => {
@@ -404,6 +1001,9 @@ function App() {
         return
       }
 
+      if (!window.MediaRecorder) {
+        throw new Error('This browser does not support microphone recording.')
+      }
       const preferredType = [
         'audio/webm;codecs=opus',
         'audio/ogg;codecs=opus',
@@ -431,11 +1031,15 @@ function App() {
                 Authorization: `Bearer ${speechSettings.apiKey}`,
                 'Content-Type': 'audio/wav',
                 'X-Speech-Model': speechSettings.modelId,
+                'X-Speech-Correction': String(isVoiceEditing),
               },
               body: wav,
             })
-            const result: { text?: string; detail?: string } =
-              await response.json()
+            const result: {
+              text?: string
+              detail?: string
+              segments?: ServerTranscriptSegment[]
+            } = await response.json()
             if (!response.ok)
               throw new Error(result.detail ?? 'Transcription failed.')
             const transcript = result.text?.trim()
@@ -445,9 +1049,20 @@ function App() {
               )
 
             const existingNote = notes[paragraphIndex] ?? ''
-            const updatedNote = appendTranscript(existingNote, transcript)
-            persistNotes({ ...notes, [paragraphIndex]: updatedNote })
-            setNoteDraft(updatedNote)
+            if (isVoiceEditing && voiceEditSelection) {
+              applyVoiceEditReplacement(transcript)
+            } else {
+              const updatedNote = appendTranscript(existingNote, transcript)
+              persistNotes({ ...notes, [paragraphIndex]: updatedNote })
+              setNoteDraft(updatedNote)
+              const segments = prepareReviewSegments(result.segments ?? [])
+              if (segments.length) {
+                persistTranscriptReviews({
+                  ...transcriptReviews,
+                  [paragraphIndex]: { baseText: existingNote, segments },
+                })
+              }
+            }
             setVoiceError('')
             setVoiceState('idle')
           } catch (error) {
@@ -481,7 +1096,17 @@ function App() {
       )
       setVoiceState('error')
     }
-  }, [activeParagraphIndex, notes, persistNotes, speechSettings])
+  }, [
+    activeParagraphIndex,
+    applyVoiceEditReplacement,
+    isVoiceEditing,
+    notes,
+    persistNotes,
+    persistTranscriptReviews,
+    speechSettings,
+    transcriptReviews,
+    voiceEditSelection,
+  ])
 
   const stopVoiceCapture = useCallback(() => {
     voiceHoldRef.current = false
@@ -509,7 +1134,7 @@ function App() {
       if (
         target instanceof HTMLElement &&
         target.closest(
-          'input, textarea, select, [contenteditable="true"], button:not(.voice-capture)',
+          'input, textarea, select, [contenteditable="true"], button:not(.voice-capture):not(.voice-edit-word)',
         )
       )
         return
@@ -517,6 +1142,7 @@ function App() {
       if (
         event.repeat ||
         isEditingNote ||
+        (isVoiceEditing && !voiceEditSelection) ||
         isSettingsOpen ||
         voiceState === 'recording' ||
         voiceState === 'transcribing'
@@ -540,10 +1166,12 @@ function App() {
     }
   }, [
     isEditingNote,
+    isVoiceEditing,
     isSettingsOpen,
     startVoiceCapture,
     stopVoiceCapture,
     voiceState,
+    voiceEditSelection,
   ])
 
   return (
@@ -663,7 +1291,11 @@ function App() {
               className={`voice-capture${voiceState === 'recording' ? ' is-recording' : ''}`}
               type="button"
               aria-pressed={voiceState === 'recording'}
-              disabled={voiceState === 'transcribing' || isEditingNote}
+              disabled={
+                voiceState === 'transcribing' ||
+                isEditingNote ||
+                (isVoiceEditing && !voiceEditSelection)
+              }
               onPointerDown={(event) => {
                 event.preventDefault()
                 if (!speechSettings.apiKey) {
@@ -696,12 +1328,18 @@ function App() {
             >
               <span className="voice-indicator" aria-hidden="true" />
               {voiceState === 'recording'
-                ? 'Release to finish thought'
+                ? isVoiceEditing
+                  ? 'Release to replace selection'
+                  : 'Release to finish thought'
                 : voiceState === 'transcribing'
                   ? 'Transcribing…'
-                  : speechSettings.apiKey
-                    ? 'Hold to speak a thought'
-                    : 'Add API key to speak'}
+                  : isVoiceEditing
+                    ? voiceEditSelection
+                      ? 'Hold to replace selection'
+                      : 'Choose a word to edit'
+                    : speechSettings.apiKey
+                      ? 'Hold to speak a thought'
+                      : 'Add API key to speak'}
             </button>
           )}
           {voiceState !== 'idle' && (
@@ -710,7 +1348,9 @@ function App() {
               role="status"
             >
               {voiceState === 'recording'
-                ? 'Listening — release to finish your thought.'
+                ? isVoiceEditing
+                  ? 'Listening — release to replace the selected words.'
+                  : 'Listening — release to finish your thought.'
                 : voiceState === 'transcribing'
                   ? 'Writing your thought in the margin…'
                   : voiceError}
@@ -721,7 +1361,9 @@ function App() {
           ) : isLivePreview && noteDraft ? (
             <div className="saved-note live-note">
               <div className="saved-note-header">
-                <p className="saved-note-label">YOUR THOUGHT</p>
+                <p className="saved-note-label">
+                  {isVoiceEditing ? 'VOICE EDIT' : 'YOUR THOUGHT'}
+                </p>
                 <span className="saved-note-status">WRITING</span>
               </div>
               <p className="saved-note-text">{noteDraft}</p>
@@ -729,57 +1371,225 @@ function App() {
           ) : activeNote && !isEditingNote ? (
             <div className="saved-note">
               <div className="saved-note-header">
-                <p className="saved-note-label">YOUR THOUGHT</p>
-                <span className="saved-note-status">SAVED</span>
+                <p className="saved-note-label">
+                  {isVoiceEditing ? 'EDITING BY VOICE' : 'YOUR THOUGHT'}
+                </p>
+                <span className="saved-note-status">
+                  {isVoiceEditing ? 'SELECT A WORD' : 'SAVED'}
+                </span>
               </div>
-              <p className="saved-note-text">{activeNote}</p>
-              <div className="note-actions">
-                {confirmingDelete ? (
-                  <>
-                    <span className="delete-prompt">Delete this thought?</span>
+              {isVoiceEditing ? (
+                <p className="review-note-hint">
+                  Tap a word. Choose “Extend to phrase” to include more words,
+                  or use Shift and the arrow keys.
+                </p>
+              ) : (
+                activeReview?.segments.some((segment) =>
+                  segment.alternatives.some(
+                    (alternative) => alternative !== segment.selected,
+                  ),
+                ) && (
+                  <p className="review-note-hint">
+                    Underlined words have another take. Tap one to choose a
+                    version.
+                  </p>
+                )
+              )}
+              {isVoiceEditing ? (
+                renderVoiceEditWords(activeNote)
+              ) : activeReview ? (
+                renderTranscript(activeReview)
+              ) : (
+                <p className="saved-note-text">{activeNote}</p>
+              )}
+              {isVoiceEditing && (
+                <div className="voice-edit-panel">
+                  <div className="voice-edit-panel-header">
+                    <p className="correction-label">
+                      {voiceEditSelection
+                        ? `SELECTED: ${activeNote.slice(voiceEditSelection.start, voiceEditSelection.end)}`
+                        : 'CHOOSE A WORD OR PHRASE'}
+                    </p>
                     <button
-                      className="text-button"
+                      className={`text-button${isExtendingSelection ? ' is-active' : ''}`}
                       type="button"
-                      onClick={() => setConfirmingDelete(false)}
+                      aria-pressed={isExtendingSelection}
+                      onClick={() =>
+                        setIsExtendingSelection((current) => !current)
+                      }
                     >
-                      Keep
+                      {isExtendingSelection
+                        ? 'Tap end of phrase'
+                        : 'Extend to phrase'}
                     </button>
+                  </div>
+                  {voiceEditSelection && voiceEditAlternatives.length > 0 && (
+                    <div className="correction-options">
+                      <p className="correction-hint">
+                        Another way NVIDIA heard it
+                      </p>
+                      {voiceEditAlternatives.map((alternative) => (
+                        <button
+                          className="correction-option"
+                          type="button"
+                          key={alternative}
+                          onClick={() => applyVoiceEditReplacement(alternative)}
+                        >
+                          {alternative}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {voiceEditUndo?.paragraphIndex === activeParagraphIndex && (
                     <button
-                      className="text-button danger"
+                      className="text-button voice-edit-undo"
                       type="button"
-                      onClick={() => {
-                        const updated = { ...notes }
-                        delete updated[activeParagraphIndex]
-                        persistNotes(updated)
-                        setNoteDraft('')
-                        setConfirmingDelete(false)
-                      }}
+                      onClick={undoVoiceEdit}
                     >
-                      Delete
+                      Undo last change
                     </button>
-                  </>
-                ) : (
-                  <>
+                  )}
+                  <div className="voice-edit-actions">
                     <button
                       className="text-button"
                       type="button"
                       onClick={() => {
                         setNoteDraft(activeNote)
+                        setIsVoiceEditing(false)
+                        setVoiceEditSelection(null)
+                        setIsExtendingSelection(false)
+                      }}
+                    >
+                      Done
+                    </button>
+                    <button
+                      className="text-button text-button-subtle"
+                      type="button"
+                      onClick={() => {
+                        setNoteDraft(activeNote)
+                        setIsVoiceEditing(false)
+                        setVoiceEditSelection(null)
                         setIsEditingNote(true)
                       }}
                     >
-                      Edit
+                      Edit with keyboard
                     </button>
-                    <button
-                      className="text-button danger"
-                      type="button"
-                      onClick={() => setConfirmingDelete(true)}
-                    >
-                      Delete
-                    </button>
-                  </>
+                  </div>
+                </div>
+              )}
+              {!isVoiceEditing &&
+                activeReview &&
+                openCorrection &&
+                activeCorrectionSegment && (
+                  <div className="correction-panel">
+                    <div className="correction-panel-header">
+                      <div>
+                        <p className="correction-label">A DIFFERENT TAKE</p>
+                        <p className="correction-hint">
+                          Tap a version that sounds like what you said.
+                        </p>
+                      </div>
+                      <button
+                        className="text-button"
+                        type="button"
+                        onClick={() => setOpenCorrection(null)}
+                        aria-label="Close word suggestions"
+                      >
+                        Done
+                      </button>
+                    </div>
+                    <div className="correction-options">
+                      {activeCorrectionSegment.alternatives
+                        .filter(
+                          (alternative) =>
+                            alternative !== activeCorrectionSegment.selected,
+                        )
+                        .map((alternative) => (
+                          <button
+                            className="correction-option"
+                            type="button"
+                            key={alternative}
+                            onClick={() =>
+                              chooseAlternative(
+                                openCorrection.segmentIndex,
+                                alternative,
+                              )
+                            }
+                          >
+                            {alternative}
+                          </button>
+                        ))}
+                    </div>
+                  </div>
                 )}
-              </div>
+              {!isVoiceEditing && (
+                <div className="note-actions">
+                  {confirmingDelete ? (
+                    <>
+                      <span className="delete-prompt">
+                        Delete this thought?
+                      </span>
+                      <button
+                        className="text-button"
+                        type="button"
+                        onClick={() => setConfirmingDelete(false)}
+                      >
+                        Keep
+                      </button>
+                      <button
+                        className="text-button danger"
+                        type="button"
+                        onClick={() => {
+                          const updated = { ...notes }
+                          delete updated[activeParagraphIndex]
+                          persistNotes(updated)
+                          const updatedReviews = { ...transcriptReviews }
+                          delete updatedReviews[activeParagraphIndex]
+                          persistTranscriptReviews(updatedReviews)
+                          setOpenCorrection(null)
+                          setNoteDraft('')
+                          setConfirmingDelete(false)
+                        }}
+                      >
+                        Delete
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        className="text-button"
+                        type="button"
+                        onClick={() => {
+                          setIsVoiceEditing(true)
+                          setVoiceEditSelection(null)
+                          setIsExtendingSelection(false)
+                          setVoiceEditUndo(null)
+                          setOpenCorrection(null)
+                        }}
+                      >
+                        Edit by voice
+                      </button>
+                      <button
+                        className="text-button text-button-subtle"
+                        type="button"
+                        onClick={() => {
+                          setNoteDraft(activeNote)
+                          setIsEditingNote(true)
+                        }}
+                      >
+                        Edit with keyboard
+                      </button>
+                      <button
+                        className="text-button danger"
+                        type="button"
+                        onClick={() => setConfirmingDelete(true)}
+                      >
+                        Delete
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           ) : isEditingNote ? (
             <form
@@ -792,6 +1602,10 @@ function App() {
                     ...notes,
                     [activeParagraphIndex]: text,
                   })
+                  const updatedReviews = { ...transcriptReviews }
+                  delete updatedReviews[activeParagraphIndex]
+                  persistTranscriptReviews(updatedReviews)
+                  setOpenCorrection(null)
                   setNoteDraft(text)
                   setIsEditingNote(false)
                 }
@@ -802,7 +1616,7 @@ function App() {
                   <span className="composer-pencil" aria-hidden="true">
                     ✎
                   </span>
-                  YOUR THOUGHT
+                  EDIT YOUR THOUGHT
                 </label>
                 <button
                   className="text-button"
@@ -815,6 +1629,10 @@ function App() {
                   Cancel
                 </button>
               </div>
+              <p className="composer-guidance">
+                Keep the words that still sound like you. Your note changes only
+                when you save.
+              </p>
               <textarea
                 id="note-draft"
                 autoFocus
@@ -834,7 +1652,7 @@ function App() {
                   type="submit"
                   disabled={!noteDraft.trim()}
                 >
-                  Save thought <span aria-hidden="true">↗</span>
+                  Save changes <span aria-hidden="true">↗</span>
                 </button>
               </div>
             </form>
@@ -861,9 +1679,13 @@ function App() {
         <span>
           {activeParagraphIndex === null
             ? 'select a passage first'
-            : voiceState === 'recording'
-              ? 'release to finish thought'
-              : 'hold to speak'}
+            : isVoiceEditing
+              ? voiceEditSelection
+                ? 'hold to replace selected words'
+                : 'tap a word to begin editing'
+              : voiceState === 'recording'
+                ? 'release to finish thought'
+                : 'hold to speak'}
         </span>
       </div>
 
