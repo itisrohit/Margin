@@ -204,6 +204,8 @@ async def ask(client: httpx.AsyncClient, key: str, owner: str, case: Case) -> di
         "steps": metrics.get("steps"),
         "toolCalls": metrics.get("toolCalls", len(steps)),
         "fallback": metrics.get("fallback"),
+        "route": metrics.get("route"),
+        "forced": metrics.get("forced"),
         "agent": bool(metrics.get("agent")),
         "citationsValid": cited <= ids,
         "strippedCitations": metrics.get("strippedCitations", 0),
@@ -285,6 +287,10 @@ async def main() -> None:
                 notes = []
                 if result["extra"]:
                     notes.append(f"also {', '.join(result['extra'])}")
+                if result["forced"]:
+                    notes.append(f"router forced {result['forced']}")
+                elif result["route"]:
+                    notes.append(f"router {result['route']}")
                 if result["fallback"]:
                     notes.append(f"fallback: {result['fallback']}")
                 if not result["citationsValid"] or result["strippedCitations"]:
@@ -320,6 +326,7 @@ async def main() -> None:
         )
         / max(1, len(answered)),
         "fallbacks": sum(bool(r["fallback"]) for r in results),
+        "routerForced": sum(bool(r["forced"]) for r in results),
         "errors": sum(bool(r["error"]) for r in results),
         "firstAnswerMs": {"p50": percentile(first, 0.5), "p95": percentile(first, 0.95)},
         "totalMs": {"p50": percentile(total, 0.5), "p95": percentile(total, 0.95)},

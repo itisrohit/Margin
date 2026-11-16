@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import unittest
@@ -11,6 +12,7 @@ from fastapi import FastAPI
 
 import agent
 import companion
+import router
 
 ARTICLE = "https://example.com/article"
 
@@ -214,11 +216,80 @@ class CitationGuardTests(unittest.TestCase):
         self.assertEqual(out, "A list [see below] and [2a].")
 
 
+def axis(*weights: float) -> list[float]:
+    return list(weights)
+
+
+def verdict(tool: str | None, **scores: float) -> router.Route:
+    ranked = sorted(scores.values(), reverse=True) + [0.0, 0.0]
+    return router.Route(tool, ranked[0], ranked[1], scores)
+
+
+class RouterTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.exemplars = {
+            "search_notes": [axis(1, 0, 0)],
+            "search_library": [axis(0, 1, 0)],
+            router.ANSWER: [axis(0, 0, 1)],
+        }
+
+    def test_confident_when_clear_of_threshold_and_runner_up(self):
+        result = router.classify(axis(1, 0.1, 0), self.exemplars, threshold=0.6, margin=0.05)
+        self.assertEqual(result.tool, "search_notes")
+        self.assertTrue(result.confident)
+
+    def test_abstains_below_threshold_or_without_margin(self):
+        weak = router.classify(axis(1, 1, 1), self.exemplars, threshold=0.7, margin=0.0)
+        self.assertIsNone(weak.tool)
+        close = router.classify(axis(1, 0.97, 0), self.exemplars, threshold=0.5, margin=0.05)
+        self.assertIsNone(close.tool)
+
+    def test_plan_forces_clear_intents_and_prefetches_searches(self):
+        self.assertEqual(agent.plan(None, "passage"), (None, []))
+        self.assertEqual(agent.plan(verdict(None, search_notes=0.5), "passage"), (None, []))
+        self.assertEqual(agent.plan(verdict(router.ANSWER, answer=0.9), "passage"), (None, []))
+        self.assertEqual(
+            agent.plan(verdict("propose_note", propose_note=0.9), "passage"),
+            ("propose_note", []),
+        )
+        self.assertEqual(
+            agent.plan(verdict("search_notes", search_notes=0.9), "passage"),
+            ("search_notes", ["search_notes"]),
+        )
+        # Library scope already searched the library for this question.
+        self.assertEqual(
+            agent.plan(verdict("search_library", search_library=0.9), "library"), (None, [])
+        )
+
+    def test_plan_compound_question_prefetches_both_and_forces_neither(self):
+        with patch.object(router, "THRESHOLD", 0.6):
+            both = verdict("search_notes", search_notes=0.9, search_library=0.8)
+            self.assertEqual(
+                agent.plan(both, "passage"), (None, ["search_notes", "search_library"])
+            )
+
+    async def test_examples_are_embedded_once_per_key_in_batches(self):
+        router._exemplars.clear()
+        calls = []
+
+        async def embed(texts, key, kind):
+            calls.append((len(texts), key, kind))
+            return [[1.0, 0.0] for _ in texts]
+
+        with patch.object(companion, "embeddings", side_effect=embed):
+            await router.exemplar_vectors("key-a")
+            await router.exemplar_vectors("key-a")
+            first = len(calls)
+            await router.exemplar_vectors("key-b")
+        total = sum(len(v) for v in router.ROUTES.values())
+        self.assertEqual(sum(n for n, *_ in calls[:first]), total)
+        self.assertTrue(all(n <= 16 and kind == "query" for n, _, kind in calls))
+        self.assertEqual(len(calls), first * 2)
+        router._exemplars.clear()
+
+
 class SpeculationTests(unittest.TestCase):
-    def test_hints_and_similarity(self):
-        self.assertTrue(agent.NOTES_HINT.search("What did I think about this last week?"))
-        self.assertTrue(agent.LIBRARY_HINT.search("How does this connect to what I've read?"))
-        self.assertFalse(agent.NOTES_HINT.search("What does the author mean by residue?"))
+    def test_similarity(self):
         self.assertTrue(agent.similar("pressure creativity", "Does pressure hurt creativity?"))
         self.assertFalse(agent.similar("sleep memory", "Does pressure hurt creativity?"))
 
@@ -232,6 +303,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         self.body = question().model_dump(by_alias=True, mode="json")
         self.requests: list[dict[str, Any]] = []
+        self.route: router.Route | None = None  # the router abstains unless a test says
         self.env = patch.dict(os.environ, {"MARGIN_AGENT": "1"})
         self.env.start()
 
@@ -253,6 +325,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(companion, "query_vector", AsyncMock(return_value=([0.0], False))),
                 patch.object(companion, "ensure_search_index"),
                 patch.object(companion, "search", **patches),
+                patch.object(agent, "route_question", AsyncMock(return_value=self.route)),
             ):
                 response = await self.client.post(
                     "/companion/ask", json=self.body, headers={"Authorization": "Bearer test"}
@@ -385,8 +458,9 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proposal["paragraphIndex"], 1)
         self.assertEqual(events[-1]["type"], "done")
 
-    async def test_save_request_forces_a_draft_on_the_current_passage(self):
+    async def test_confident_route_forces_a_draft_on_the_current_passage(self):
         self.body["question"] = "Save a note here saying switching costs are underrated."
+        self.route = verdict("propose_note", propose_note=0.82, answer=0.6)
         events = await self.run_with(
             [
                 sse(tool_call("propose_note", {"text": "Switching costs are underrated."})),
@@ -404,6 +478,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejected_forced_tool_retries_on_auto(self):
         self.body["question"] = "Could you save a note that pressure cuts both ways?"
+        self.route = verdict("propose_note", propose_note=0.8, answer=0.5)
         events = await self.run_with(
             [
                 httpx.Response(400, json={"error": "named tool_choice unsupported"}),
@@ -417,16 +492,21 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["metrics"]["forcedToolRejected"], 400)
         self.assertNotIn("fallback", events[-1]["metrics"])
 
-    def test_save_hint(self):
-        for asked in [
-            "Save a note here saying switching costs are underrated.",
-            "please note this down",
-            "Can you add a note that this is weak?",
-            "Remember that I disagree with this.",
-        ]:
-            self.assertTrue(agent.SAVE_HINT.search(asked), asked)
-        for asked in ["What notes have I saved?", "Is this worth a note?"]:
-            self.assertFalse(agent.SAVE_HINT.search(asked), asked)
+    async def test_unsure_router_leaves_the_choice_to_the_model(self):
+        self.body["question"] = "Save a note here saying switching costs are underrated."
+        events = await self.run_with(
+            [sse(text("A plain answer from this passage [2]."))], return_value=[]
+        )
+        self.assertEqual(self.requests[0]["tool_choice"], "auto")
+        self.assertNotIn("forced", events[-1]["metrics"])
+
+    async def test_slow_router_abstains(self):
+        async def slow(*_):
+            await asyncio.sleep(5)
+
+        with patch.object(agent, "ROUTE_TIMEOUT", 0.01):
+            task = asyncio.create_task(slow())
+            self.assertIsNone(await agent.settle(task))
 
     async def test_request_flag_overrides_the_server_default(self):
         with patch.dict(os.environ, {"MARGIN_AGENT": "0"}):

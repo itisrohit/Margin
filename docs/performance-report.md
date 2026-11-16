@@ -37,6 +37,12 @@ To measure: start the API with `MARGIN_AGENT=1`, then run
 steps, the share of answers whose citations are all valid, fallbacks, and client-measured
 p50/p95 time to first text and full answer.
 
+Tool choice starts with a semantic router whose threshold and margin are placeholders
+until `benchmarks/router_eval.py` is run (key only; no server needed). It reports
+precision (correct when it acts) and coverage (how often it acts) across settings, and
+writes `api/benchmarks/results/router_eval.json`. Report the chosen setting with both
+numbers, and note its 54 questions were written by hand.
+
 Limitations to keep when reporting: 15 hand-written questions over a 5-article synthetic
 library, one run, one model. One changed answer moves accuracy by about 7 points, and p95
 of 15 samples is close to the maximum. Tool-selection "accuracy" checks that the expected

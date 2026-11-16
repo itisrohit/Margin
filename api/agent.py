@@ -5,8 +5,9 @@ Design (see docs/companion.md, "Agent mode"):
     answered in one model call at today's speed. Tools are for when that's not enough.
   - Every model call streams. If the model answers with text, that text is the answer;
     there is no separate "now write the answer" call.
-  - Lookups the question obviously needs (notes, library) are started speculatively in
-    parallel with the first model call, and reused if the model asks for them.
+  - A semantic router (router.py) classifies the question by embedding similarity. When
+    it is confident, step 1 is required to call that tool and the expected searches start
+    alongside the model call; when it is unsure, the model decides on its own.
   - Several tool calls in one step run in parallel. Hard cap of MAX_STEPS model calls
     and a total timeout; then the model answers with what it has and says so.
   - Citations may only reference ids shown this turn; others are stripped.
@@ -18,7 +19,6 @@ Design (see docs/companion.md, "Agent mode"):
 import asyncio
 import json
 import os
-import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
@@ -34,6 +34,8 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 import companion as core
+from router import ANSWER, SEARCHES, Route
+from router import route as route_question
 
 AGENT_MODEL = os.getenv("MARGIN_AGENT_MODEL", core.MODEL)
 MAX_STEPS = 4  # model calls per answer, including the one that writes the answer
@@ -52,6 +54,10 @@ TOOL_GUIDE = (
     "what the reader thought, noted or wrote (use days for phrases like 'last week'); "
     "search_library for other articles they have read; search_article for elsewhere in "
     "this article; get_passage to read around a numbered passage.\n"
+    "- Examples: 'What did I note about X last week?' -> search_notes(query='X', days=7). "
+    "'Do my other articles cover X?' -> search_library(query='X'). 'Does the author come "
+    "back to X?' -> search_article(query='X'). 'Save a note here that Y' -> "
+    "propose_note(text='Y'). 'What does this mean?' -> no tool, just answer.\n"
     "- You may call several tools at once. Keep queries short and specific.\n"
     "- Tool results add numbered passages. Cite them like the others, and never cite a "
     "number you have not been shown.\n"
@@ -124,10 +130,11 @@ TOOLS: list[dict[str, Any]] = [
                 "properties": {
                     "passage_id": {
                         "type": "integer",
-                        "description": "The passage number, as shown in brackets.",
+                        "description": "The passage number, as shown in brackets. Leave out "
+                        "for the passage the reader is on.",
                     }
                 },
-                "required": ["passage_id"],
+                "required": [],
             },
         },
     },
@@ -168,11 +175,10 @@ class NotesArgs(QueryArgs):
 
 
 class PassageArgs(Args):
-    passage_id: int = Field(ge=1)
-
-
-class NoteArgs(Args):
     passage_id: int | None = Field(default=None, ge=1)
+
+
+class NoteArgs(PassageArgs):
     text: str = Field(min_length=1, max_length=800)
 
 
@@ -381,7 +387,7 @@ async def run_tool(turn: Turn, name: str, raw: str) -> tuple[dict[str, Any], str
             return step, "No matches.", []
         return step, "\n\n".join(describe(turn, s, new) for s, new in added), []
 
-    assert isinstance(args, PassageArgs | NoteArgs)
+    assert isinstance(args, PassageArgs)
     passage_id = args.passage_id or turn.selected_id
     if passage_id is None:
         raise ToolError("Say which passage number the note belongs to.")
@@ -424,37 +430,36 @@ async def run_tool(turn: Turn, name: str, raw: str) -> tuple[dict[str, Any], str
 
 # --- speculation -------------------------------------------------------------------
 
-SAVE_HINT = re.compile(
-    r"^\s*(please\s+)?((can|could|would|will) you\s+)?(please\s+)?"
-    r"((save|add|write|make|jot|draft|leave|keep)\b.{0,40}\bnotes?\b"
-    r"|note (this|that|down|here)\b|remember (this|that)\b)",
-    re.I,
-)
 
-NOTES_HINT = re.compile(
-    r"\b(my|i|i've|i'd)\b[^.?!]{0,40}\b(thoughts?|notes?|noted|wrote|written|think|thinking"
-    r"|said|highlight\w*)\b|\b(last|this) (week|month)\b|\byesterday\b",
-    re.I,
-)
-LIBRARY_HINT = re.compile(
-    r"\b(library|other articles?|elsewhere|across|everything i|i(?:'ve| have) read"
-    r"|connect\w*|compare\w*)\b",
-    re.I,
-)
-
-
-def start_prefetch(turn: Turn) -> None:
-    """Start the lookups the question obviously needs, alongside the first model call."""
-    question = turn.question.question
-    wanted = []
-    if NOTES_HINT.search(question):
-        wanted.append("search_notes")
-    if LIBRARY_HINT.search(question) and turn.question.scope != "library":
-        wanted.append("search_library")
-    for name in wanted:
-        task = asyncio.create_task(search_tool(turn, name, question[:300]))
+def start_prefetch(turn: Turn, names: list[str]) -> None:
+    """Start the searches the router expects, alongside the first model call."""
+    for name in names:
+        if name in turn.prefetch:
+            continue
+        task = asyncio.create_task(search_tool(turn, name, turn.question.question[:300]))
         task.add_done_callback(lambda done: done.cancelled() or done.exception())
         turn.prefetch[name] = task
+
+
+def plan(route: Route | None, scope: str) -> tuple[str | None, list[str]]:
+    """From the router's verdict: the tool to require on step 1, and searches to prefetch.
+
+    Abstaining, or a passage-only question, leaves the choice to the model. A compound
+    question (two searches both clear the threshold) prefetches both and forces neither,
+    so the model can call them together.
+    """
+    if route is None or not route.confident or route.tool == ANSWER:
+        return None, []
+    tool = route.tool
+    if tool == "search_library" and scope == "library":
+        return None, []  # the library was already searched for this question
+    if tool in SEARCHES:
+        also = [
+            name for name in route.also if not (name == "search_library" and scope == "library")
+        ]
+        prefetch = [name for name in [tool, *also] if name != "search_article"]
+        return (None if also else tool), prefetch
+    return tool, []
 
 
 # --- model -------------------------------------------------------------------------
@@ -513,6 +518,16 @@ def collect(calls: dict[int, dict[str, str]], chunk: dict[str, Any]) -> None:
 
 # --- loop --------------------------------------------------------------------------
 
+ROUTE_TIMEOUT = 1.5  # never let routing hold up an answer for long
+
+
+async def settle(task: asyncio.Task) -> Route | None:
+    """The router's verdict, or None (abstain) if it failed or took too long."""
+    try:
+        return await asyncio.wait_for(task, ROUTE_TIMEOUT)
+    except (TimeoutError, httpx.HTTPError, ValueError, KeyError, IndexError):
+        return None
+
 
 async def run_agent(
     question: core.Question,
@@ -522,15 +537,27 @@ async def run_agent(
     timing: dict[str, object],
 ) -> AsyncIterator[str]:
     timing.update(agent=True, model=AGENT_MODEL)
+    # Route while the starting evidence is gathered; both need the embedding service.
+    tick = perf_counter()
+    routing = asyncio.create_task(route_question(question.question, key, question.client_id))
     try:
         sources, library = await core.gather_sources(question, key, timing)
     except (httpx.HTTPError, KeyError, ValueError, HTTPException, SQLAlchemyError):
+        routing.cancel()
         yield core.event("error", detail=core.COMPANION_ERROR)
         return
     ledger = Ledger(sources)
     turn = Turn(question, key, ledger)
     yield core.event("sources", sources=ledger.sources)
-    start_prefetch(turn)
+    verdict = await settle(routing)
+    timing["routeMs"] = round((perf_counter() - tick) * 1000, 1)
+    if verdict is not None:
+        timing["route"] = verdict.tool or "abstain"
+        timing["routeScore"] = round(verdict.score, 3)
+    force, prefetch = plan(verdict, question.scope)
+    if force:
+        timing["forced"] = force
+    start_prefetch(turn, prefetch)
 
     messages = core.base_messages(question, TOOL_GUIDE)
     timing["historyTurns"] = (len(messages) - 1) // 2
@@ -541,9 +568,6 @@ async def run_agent(
             "means that one.)"
         )
     messages.append({"role": "user", "content": prompt})
-    # A plain request to save a note: make the first step draft it, instead of trusting
-    # a small model to notice.
-    force = "propose_note" if SAVE_HINT.search(question.question) else None
     deadline = started + TOTAL_TIMEOUT
     answer: core.AnswerStream | None = None
     step_id = 0

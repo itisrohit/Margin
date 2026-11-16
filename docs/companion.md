@@ -53,10 +53,21 @@ it can call these tools, through the model's native OpenAI-compatible tool calli
 Every tool result adds sources to the turn's numbering, and answers may only cite numbers
 shown in that turn; any other citation is stripped from the stream (both modes).
 
+How it picks tools reliably: a small model choosing tools alone is right most of the
+time, not every time, so tool choice is a cascade. First a semantic router
+(`api/router.py`) compares the question's embedding with example questions for each
+intent (save a note, search notes, search library, search this article, read around a
+passage, or just answer). When the best intent clears `MARGIN_ROUTER_THRESHOLD` and beats
+the runner-up by `MARGIN_ROUTER_MARGIN`, step 1 is required to call that tool (a question
+that needs two searches gets both prefetched and neither forced). Otherwise the router
+abstains and the model chooses, guided by a few examples in its instructions. Routing runs
+alongside gathering the starting evidence and gives up after 1.5 s. The defaults (0.70 / 0.05)
+are deliberately cautious, so an untuned router rarely acts; tune them with `benchmarks/router_eval.py`, which sweeps both values on 54
+held-out questions and recommends the setting with the most coverage at 97% precision.
+
 How it stays fast: every model call streams, so an answer is never a separate extra call;
-several tool calls in one step run in parallel; and lookups the question obviously needs
-(phrases like "my notes", "last week", "what I've read") are started alongside the first
-model call and reused if the model asks for something similar. Limits: 4 model calls per
+several tool calls in one step run in parallel; and searches the router expects are started
+alongside the first model call and reused if the model asks for something similar. Limits: 4 model calls per
 answer and `MARGIN_AGENT_TIMEOUT` seconds (default 30); on either, the model answers with
 what it has and says so. Bad tool arguments or failed lookups are reported back to the
 model as errors. If the provider rejects tool calling, or the model returns no answer
@@ -67,7 +78,8 @@ query?, results?, paragraphIndex?}`, sent when a lookup starts and again when it
 `proposal` (`{id, paragraphIndex, sourceId, text, status: "pending"}`), and further
 `sources` events whenever lookups add sources (each replaces the previous list).
 `done.metrics` adds `agent`, `steps`, `toolCalls`, `prefetchHits`, `strippedCitations`,
-and `fallback` or `stoppedEarly` when they apply. Steps and proposals are saved with the
+`route`, `routeScore`, `routeMs`, and `forced`, `fallback` or `stoppedEarly` when they
+apply. Steps and proposals are saved with the
 chat. `api/benchmarks/agent_eval.py` measures tool choice, steps, citation validity and
 latency; see `docs/performance-report.md`.
 
