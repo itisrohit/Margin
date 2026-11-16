@@ -29,6 +29,19 @@ function loadArticle(): ImportedArticle | null {
   return null
 }
 const LIBRARY_KEY = 'margin:article-library'
+const READING_POSITION_KEY = 'margin:reading-positions'
+function loadReadingPositions(): Record<string, number> {
+  try {
+    const value: unknown = JSON.parse(
+      localStorage.getItem(READING_POSITION_KEY) ?? '{}',
+    )
+    return typeof value === 'object' && value !== null
+      ? (value as Record<string, number>)
+      : {}
+  } catch {
+    return {}
+  }
+}
 function loadLibrary(): ImportedArticle[] {
   try {
     const saved = JSON.parse(localStorage.getItem(LIBRARY_KEY) ?? '[]')
@@ -479,6 +492,19 @@ const articleSections = paragraphs.flatMap((text, index) =>
       ? [{ index, title: `Passage ${index + 1}` }]
       : [],
 )
+// Essays without section headings still need a useful reading navigator.
+if (articleSections.length < 2 && paragraphs.length > 1) {
+  const interval = Math.max(1, Math.ceil(paragraphs.length / 24))
+  articleSections.length = 0
+  paragraphs.forEach((text, index) => {
+    if (index % interval !== 0) return
+    const preview = text.trim().replace(/\s+/g, ' ')
+    articleSections.push({
+      index,
+      title: preview.length > 90 ? `${preview.slice(0, 87).trimEnd()}…` : preview,
+    })
+  })
+}
 if (articleSections.length && articleSections[0].index !== 0) {
   articleSections.unshift({ index: 0, title: 'Introduction' })
 }
@@ -708,6 +734,8 @@ function App() {
   const [articleError, setArticleError] = useState('')
   const [library, setLibrary] = useState<ImportedArticle[]>(loadLibrary)
   const [libraryOpen, setLibraryOpen] = useState(false)
+  const [readingPositions, setReadingPositions] = useState(loadReadingPositions)
+  const [readingProgress, setReadingProgress] = useState(0)
   const [activeParagraphIndex, setActiveParagraphIndex] = useState<
     number | null
   >(null)
@@ -764,6 +792,34 @@ function App() {
   }>({ apiKey: '', notes: {} })
   const voiceHoldRef = useRef(false)
   const holdSourceRef = useRef<'keyboard' | 'pointer' | null>(null)
+
+  useEffect(() => {
+    const update = () => {
+      const max = document.documentElement.scrollHeight - window.innerHeight
+      setReadingProgress(
+        max > 0 ? Math.max(0, Math.min(1, window.scrollY / max)) : 0,
+      )
+    }
+    window.addEventListener('scroll', update, { passive: true })
+    window.addEventListener('resize', update)
+    update()
+    return () => {
+      window.removeEventListener('scroll', update)
+      window.removeEventListener('resize', update)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!importedArticle) return
+    const index = loadReadingPositions()[importedArticle.url]
+    if (typeof index !== 'number') return
+    const timer = window.setTimeout(() => {
+      document
+        .querySelector<HTMLElement>(`[data-paragraph-index="${index}"]`)
+        ?.scrollIntoView({ block: 'start' })
+    }, 120)
+    return () => window.clearTimeout(timer)
+  }, [])
 
   const openArticle = async (event: React.FormEvent) => {
     event.preventDefault()
@@ -1148,6 +1204,15 @@ function App() {
 
   const selectParagraph = (index: number) => {
     setActiveParagraphIndex(index)
+    if (importedArticle) {
+      const next = { ...readingPositions, [importedArticle.url]: index }
+      setReadingPositions(next)
+      try {
+        localStorage.setItem(READING_POSITION_KEY, JSON.stringify(next))
+      } catch {
+        setStorageWarning(true)
+      }
+    }
     setNoteDraft(notes[index] ?? '')
     setIsEditingNote(false)
     setConfirmingDelete(false)
@@ -1773,6 +1838,12 @@ function App() {
           )}
         </button>
       </header>
+      <div
+        className="reading-progress"
+        aria-label={`Reading progress ${Math.round(readingProgress * 100)}%`}
+      >
+        <span style={{ transform: `scaleX(${readingProgress})` }} />
+      </div>
 
       <section className="library-bar" aria-label="Your reading library">
         <button
@@ -1848,6 +1919,22 @@ function App() {
         )}
       </form>
       <ArticleOutline sections={articleSections} />
+      {importedArticle &&
+        readingPositions[importedArticle.url] !== undefined && (
+          <button
+            type="button"
+            className="resume-reading"
+            onClick={() =>
+              document
+                .querySelector<HTMLElement>(
+                  `[data-paragraph-index="${readingPositions[importedArticle.url]}"]`,
+                )
+                ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+            }
+          >
+            Resume reading <span>{Math.round(readingProgress * 100)}%</span>
+          </button>
+        )}
       <main className="reader-layout" id="top">
         <article className="article">
           <div className="article-heading">
