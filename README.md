@@ -23,6 +23,15 @@ The web app runs at <http://localhost:5173>. The API runs at <http://127.0.0.1:8
 
 Stop the local database with `bun run db:down`.
 
+## Returning thoughts
+
+Saved notes stay in browser storage. When an NVIDIA key is configured in
+Settings, Margin also sends the note and its passage to NVIDIA's embedding API
+and stores the note, passage, and vector in the configured PostgreSQL database
+so later passages can find related thoughts. The API key is forwarded for each
+embedding request and is not stored by the backend. “Not related” dismissals
+are remembered for that passage and thought.
+
 ## Quality checks
 
 ```sh
@@ -31,5 +40,10 @@ bun run format
 bun run typecheck
 bun run check
 ```
+
+Run the API tests from `api/` with `uv run python -m unittest discover -s tests -v`.
+To include the Postgres integration test, start the database and set
+`RUN_POSTGRES_INTEGRATION=1` before running the same command. It uses a mocked
+embedding and removes its synthetic records after the check.
 
 The web workspace uses Oxlint, Prettier, and TypeScript. The API uses Ruff for linting and formatting, and ty for type checking. Bun manages the JavaScript workspace; uv manages Python dependencies and the `api/uv.lock` lockfile.

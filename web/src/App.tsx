@@ -4,6 +4,11 @@ import './App.css'
 const NOTES_STORAGE_KEY = 'margin:sample-essay:notes'
 const SPEECH_SETTINGS_KEY = 'margin:speech-settings'
 const SPEECH_REVIEW_KEY = 'margin:sample-essay:speech-review'
+const THOUGHT_DATES_KEY = 'margin:thought-dates'
+const DISMISSED_CONNECTIONS_KEY = 'margin:dismissed-connections'
+const CLIENT_ID_KEY = 'margin:client-id'
+const ARTICLE_KEY = 'margin-sample-essay'
+const ARTICLE_TITLE = 'The quiet value of an unfinished thought'
 
 const speechModels = [
   {
@@ -86,6 +91,11 @@ const DEFAULT_SPEECH_MODEL_ID: SpeechModelId = speechModels[0].id
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
 const AUDIO_SAMPLE_RATE = 16_000
 
+function closeAudioContext(context: AudioContext): Promise<void> {
+  if (context.state === 'closed') return Promise.resolve()
+  return context.close().catch(() => undefined)
+}
+
 async function convertRecordingToWav(recording: Blob): Promise<ArrayBuffer> {
   const decoder = new AudioContext()
   try {
@@ -132,7 +142,7 @@ async function convertRecordingToWav(recording: Blob): Promise<ArrayBuffer> {
 
     return wav
   } finally {
-    await decoder.close()
+    await closeAudioContext(decoder)
   }
 }
 
@@ -412,6 +422,190 @@ const paragraphs = [
   'Maybe that is all a margin needs to be: a place for the conversation between what we read and what we bring to it. The page holds the words. Beside them, there is room for whatever they set in motion.',
 ]
 
+type RelatedThought = {
+  id?: string
+  paragraphIndex: number
+  note: string
+  createdAt: string
+  score: number
+  articleTitle?: string
+  articleUrl?: string
+  sourceKey?: string
+}
+
+const memoryStopWords = new Set(
+  'about after all also and are because been before being between both but can could did does each for from had has have her here him his how into its just like may more most not our out over own same she should some such than that the their them then there these they this those through too under until very was were what when where which while who why will with without would you your'.split(
+    ' ',
+  ),
+)
+
+function memoryTokens(text: string): string[] {
+  return (text.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? [])
+    .filter((token) => !memoryStopWords.has(token))
+    .map((token) =>
+      token.length > 5 && token.endsWith('ing')
+        ? token.slice(0, -3)
+        : token.length > 4 && token.endsWith('ed')
+          ? token.slice(0, -2)
+          : token.length > 4 && token.endsWith('s')
+            ? token.slice(0, -1)
+            : token,
+    )
+}
+
+function findRelatedThought(
+  currentIndex: number,
+  notes: Record<number, string>,
+  createdAtByIndex: Record<number, string>,
+  dismissedConnections: string[],
+): RelatedThought | null {
+  const candidates = Object.entries(notes)
+    .filter(([index, note]) => Number(index) !== currentIndex && note.trim())
+    .map(([index, note]) => {
+      const paragraphIndex = Number(index)
+      return {
+        paragraphIndex,
+        note,
+        createdAt:
+          createdAtByIndex[paragraphIndex] ?? new Date(0).toISOString(),
+        tokens: [
+          ...memoryTokens(note),
+          ...memoryTokens(note),
+          ...memoryTokens(paragraphs[paragraphIndex]),
+        ],
+      }
+    })
+  if (!candidates.length) return null
+
+  const queryTokens = memoryTokens(paragraphs[currentIndex])
+  const documentCount = candidates.length + 1
+  const allDocuments = [
+    queryTokens,
+    ...candidates.map((candidate) => candidate.tokens),
+  ]
+  const inverseFrequency = new Map<string, number>()
+  for (const token of new Set(queryTokens)) {
+    const count = allDocuments.filter((document) =>
+      document.includes(token),
+    ).length
+    inverseFrequency.set(token, Math.log((documentCount + 1) / (count + 1)) + 1)
+  }
+
+  const queryWeights = new Map<string, number>()
+  for (const token of queryTokens) {
+    queryWeights.set(
+      token,
+      (queryWeights.get(token) ?? 0) + (inverseFrequency.get(token) ?? 1),
+    )
+  }
+  const queryLength = Math.sqrt(
+    [...queryWeights.values()].reduce(
+      (total, weight) => total + weight * weight,
+      0,
+    ),
+  )
+  if (!queryLength) return null
+
+  const ranked = candidates
+    .filter(
+      (candidate) =>
+        !dismissedConnections.includes(
+          `${currentIndex}:${candidate.paragraphIndex}`,
+        ),
+    )
+    .map((candidate) => {
+      const candidateWeights = new Map<string, number>()
+      for (const token of candidate.tokens) {
+        if (!inverseFrequency.has(token)) continue
+        candidateWeights.set(
+          token,
+          (candidateWeights.get(token) ?? 0) +
+            (inverseFrequency.get(token) ?? 1),
+        )
+      }
+      const sharedTokens = [...queryWeights.keys()].filter((token) =>
+        candidateWeights.has(token),
+      )
+      const candidateLength = Math.sqrt(
+        [...candidateWeights.values()].reduce(
+          (total, weight) => total + weight * weight,
+          0,
+        ),
+      )
+      const dotProduct = sharedTokens.reduce(
+        (total, token) =>
+          total +
+          (queryWeights.get(token) ?? 0) * (candidateWeights.get(token) ?? 0),
+        0,
+      )
+      return {
+        paragraphIndex: candidate.paragraphIndex,
+        note: candidate.note,
+        createdAt: candidate.createdAt,
+        score:
+          sharedTokens.length < 2 || !candidateLength
+            ? 0
+            : dotProduct / (queryLength * candidateLength),
+      }
+    })
+    .sort((first, second) => second.score - first.score)
+  return ranked[0]?.score >= 0.24 ? ranked[0] : null
+}
+
+function getClientId(): string {
+  try {
+    const existing = window.localStorage.getItem(CLIENT_ID_KEY)
+    if (existing) return existing
+    const clientId = window.crypto.randomUUID()
+    window.localStorage.setItem(CLIENT_ID_KEY, clientId)
+    return clientId
+  } catch {
+    return window.crypto.randomUUID()
+  }
+}
+
+function loadThoughtDates(): Record<number, string> {
+  try {
+    const parsed: unknown = JSON.parse(
+      window.localStorage.getItem(THOUGHT_DATES_KEY) ?? '{}',
+    )
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))
+      return {}
+    const dates = Object.fromEntries(
+      Object.entries(parsed).filter(
+        ([index, value]) =>
+          Number.isInteger(Number(index)) && typeof value === 'string',
+      ),
+    )
+    let changed = false
+    for (const index of Object.keys(loadNotes())) {
+      if (!dates[Number(index)]) {
+        dates[Number(index)] = new Date().toISOString()
+        changed = true
+      }
+    }
+    if (changed) {
+      window.localStorage.setItem(THOUGHT_DATES_KEY, JSON.stringify(dates))
+    }
+    return dates
+  } catch {
+    return {}
+  }
+}
+
+function loadDismissedConnections(): string[] {
+  try {
+    const parsed: unknown = JSON.parse(
+      window.localStorage.getItem(DISMISSED_CONNECTIONS_KEY) ?? '[]',
+    )
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === 'string')
+      : []
+  } catch {
+    return []
+  }
+}
+
 function loadNotes(): Record<number, string> {
   try {
     const stored = window.localStorage.getItem(NOTES_STORAGE_KEY)
@@ -452,6 +646,20 @@ function App() {
     number | null
   >(null)
   const [notes, setNotes] = useState<Record<number, string>>(loadNotes)
+  const [thoughtDates, setThoughtDates] = useState(loadThoughtDates)
+  const [dismissedConnections, setDismissedConnections] = useState(
+    loadDismissedConnections,
+  )
+  const [relatedResult, setRelatedResult] = useState<{
+    sourceKey: string
+    thought: RelatedThought | null
+  } | null>(null)
+  const [relatedQueryError, setRelatedQueryError] = useState<string | null>(
+    null,
+  )
+  const [memorySyncError, setMemorySyncError] = useState(false)
+  const [pendingSourceKey, setPendingSourceKey] = useState<string | null>(null)
+  const [memoryVersion, setMemoryVersion] = useState(0)
   const [transcriptReviews, setTranscriptReviews] = useState<
     Record<number, TranscriptReview>
   >(loadTranscriptReviews)
@@ -484,6 +692,10 @@ function App() {
   const [voiceError, setVoiceError] = useState('')
   const recorderRef = useRef<MediaRecorder | null>(null)
   const liveCaptureRef = useRef<LiveCapture | null>(null)
+  const syncedThoughtsRef = useRef<{
+    apiKey: string
+    notes: Record<number, string>
+  }>({ apiKey: '', notes: {} })
   const voiceHoldRef = useRef(false)
   const holdSourceRef = useRef<'keyboard' | 'pointer' | null>(null)
 
@@ -496,19 +708,97 @@ function App() {
     activeParagraphIndex === null
       ? undefined
       : transcriptReviews[activeParagraphIndex]
-
-  const persistNotes = useCallback((updatedNotes: Record<number, string>) => {
-    setNotes(updatedNotes)
-    try {
-      window.localStorage.setItem(
-        NOTES_STORAGE_KEY,
-        JSON.stringify(updatedNotes),
+  const activeSourceKey =
+    activeParagraphIndex === null
+      ? null
+      : `${ARTICLE_KEY}:${activeParagraphIndex}`
+  const localRelatedThought =
+    activeParagraphIndex !== null && !speechSettings.apiKey
+      ? findRelatedThought(
+          activeParagraphIndex,
+          notes,
+          thoughtDates,
+          dismissedConnections,
+        )
+      : null
+  const serverRelatedThought =
+    activeSourceKey && relatedResult?.sourceKey === activeSourceKey
+      ? relatedResult.thought
+      : null
+  const visibleRelatedThought = speechSettings.apiKey
+    ? serverRelatedThought &&
+      !dismissedConnections.includes(
+        `${activeParagraphIndex}:${serverRelatedThought.paragraphIndex}`,
       )
-      setStorageWarning(false)
-    } catch {
-      setStorageWarning(true)
-    }
-  }, [])
+      ? serverRelatedThought
+      : null
+    : localRelatedThought
+  const isMemoryPending = Boolean(
+    speechSettings.apiKey &&
+    activeSourceKey &&
+    pendingSourceKey === activeSourceKey,
+  )
+  const hasMemoryError = Boolean(
+    speechSettings.apiKey &&
+    (memorySyncError || relatedQueryError === activeSourceKey),
+  )
+
+  const persistNotes = useCallback(
+    (updatedNotes: Record<number, string>) => {
+      const updatedDates = { ...thoughtDates }
+      for (const [index, note] of Object.entries(updatedNotes)) {
+        if (
+          note.trim() &&
+          (!notes[Number(index)] || notes[Number(index)] !== note)
+        ) {
+          updatedDates[Number(index)] = new Date().toISOString()
+        } else if (note.trim() && !updatedDates[Number(index)]) {
+          updatedDates[Number(index)] = new Date().toISOString()
+        }
+      }
+      for (const index of Object.keys(updatedDates)) {
+        if (!(Number(index) in updatedNotes)) delete updatedDates[Number(index)]
+      }
+      const changedIndexes = new Set([
+        ...Object.keys(notes).filter(
+          (index) => notes[Number(index)] !== updatedNotes[Number(index)],
+        ),
+        ...Object.keys(updatedNotes).filter(
+          (index) => notes[Number(index)] !== updatedNotes[Number(index)],
+        ),
+      ])
+      const updatedDismissals = dismissedConnections.filter((pair) => {
+        const targetIndex = pair.split(':')[1]
+        return !changedIndexes.has(targetIndex)
+      })
+
+      setNotes(updatedNotes)
+      setThoughtDates(updatedDates)
+      if (updatedDismissals.length !== dismissedConnections.length) {
+        setDismissedConnections(updatedDismissals)
+      }
+      try {
+        window.localStorage.setItem(
+          NOTES_STORAGE_KEY,
+          JSON.stringify(updatedNotes),
+        )
+        window.localStorage.setItem(
+          THOUGHT_DATES_KEY,
+          JSON.stringify(updatedDates),
+        )
+        if (updatedDismissals.length !== dismissedConnections.length) {
+          window.localStorage.setItem(
+            DISMISSED_CONNECTIONS_KEY,
+            JSON.stringify(updatedDismissals),
+          )
+        }
+        setStorageWarning(false)
+      } catch {
+        setStorageWarning(true)
+      }
+    },
+    [dismissedConnections, notes, thoughtDates],
+  )
 
   const persistTranscriptReviews = useCallback(
     (updatedReviews: Record<number, TranscriptReview>) => {
@@ -524,6 +814,130 @@ function App() {
     },
     [],
   )
+
+  useEffect(() => {
+    const previous = syncedThoughtsRef.current
+    const indexes = new Set([
+      ...Object.keys(previous.notes),
+      ...Object.keys(notes),
+    ])
+    const changedIndexes = [...indexes].filter(
+      (index) =>
+        previous.apiKey !== speechSettings.apiKey ||
+        previous.notes[Number(index)] !== notes[Number(index)],
+    )
+    const syncIndexes = speechSettings.apiKey
+      ? changedIndexes
+      : changedIndexes.filter((index) => !notes[Number(index)]?.trim())
+    if (!syncIndexes.length) return
+
+    const controller = new AbortController()
+    const timeout = window.setTimeout(() => {
+      void Promise.all(
+        syncIndexes.map(async (rawIndex) => {
+          const index = Number(rawIndex)
+          const sourceKey = `${ARTICLE_KEY}:${index}`
+          const response = await fetch(
+            `${API_URL}/thoughts/${encodeURIComponent(sourceKey)}`,
+            {
+              method: 'PUT',
+              headers: {
+                'Content-Type': 'application/json',
+                ...(speechSettings.apiKey
+                  ? { Authorization: `Bearer ${speechSettings.apiKey}` }
+                  : {}),
+              },
+              signal: controller.signal,
+              body: JSON.stringify({
+                clientId: getClientId(),
+                sourceKey,
+                note: notes[index] ?? '',
+                paragraphText: paragraphs[index],
+                paragraphIndex: index,
+                articleTitle: ARTICLE_TITLE,
+                articleUrl: `${window.location.origin}${window.location.pathname}`,
+                createdAt: thoughtDates[index] ?? new Date().toISOString(),
+              }),
+            },
+          )
+          if (!response.ok) throw new Error('Could not save this memory.')
+        }),
+      )
+        .then(() => {
+          const syncedNotes = { ...syncedThoughtsRef.current.notes }
+          for (const rawIndex of syncIndexes) {
+            const index = Number(rawIndex)
+            if (notes[index]?.trim()) syncedNotes[index] = notes[index]
+            else delete syncedNotes[index]
+          }
+          syncedThoughtsRef.current = {
+            apiKey: speechSettings.apiKey,
+            notes: syncedNotes,
+          }
+          setMemorySyncError(false)
+          setMemoryVersion((version) => version + 1)
+        })
+        .catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === 'AbortError')
+            return
+          setMemorySyncError(true)
+        })
+    }, 350)
+
+    return () => {
+      window.clearTimeout(timeout)
+      controller.abort()
+    }
+  }, [notes, speechSettings.apiKey, thoughtDates])
+
+  useEffect(() => {
+    if (activeParagraphIndex === null) return
+
+    if (!speechSettings.apiKey) return
+    if (!Object.values(notes).some((note) => note.trim())) return
+
+    const controller = new AbortController()
+    const sourceKey = `${ARTICLE_KEY}:${activeParagraphIndex}`
+    const timeout = window.setTimeout(() => {
+      setPendingSourceKey(sourceKey)
+      void fetch(`${API_URL}/thoughts/related`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${speechSettings.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          clientId: getClientId(),
+          sourceKey,
+          paragraphText: paragraphs[activeParagraphIndex],
+          note: notes[activeParagraphIndex] ?? '',
+        }),
+      })
+        .then(async (response) => {
+          if (!response.ok) throw new Error('Could not search your margins.')
+          return (await response.json()) as {
+            thought: RelatedThought | null
+          }
+        })
+        .then((result) => {
+          setRelatedResult({ sourceKey, thought: result.thought })
+          setRelatedQueryError(null)
+          setPendingSourceKey(null)
+        })
+        .catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === 'AbortError')
+            return
+          setRelatedQueryError(sourceKey)
+          setPendingSourceKey(null)
+        })
+    }, 300)
+
+    return () => {
+      window.clearTimeout(timeout)
+      controller.abort()
+    }
+  }, [activeParagraphIndex, memoryVersion, notes, speechSettings.apiKey])
 
   const chooseAlternative = (segmentIndex: number, alternative: string) => {
     if (activeParagraphIndex === null) return
@@ -625,6 +1039,46 @@ function App() {
     setIsVoiceEditing(false)
     setVoiceEditSelection(null)
     setVoiceEditUndo(null)
+  }
+
+  const dismissRelatedThought = async (thought: RelatedThought) => {
+    if (activeParagraphIndex === null) return
+    const pair = `${activeParagraphIndex}:${thought.paragraphIndex}`
+    const updated = Array.from(new Set([...dismissedConnections, pair]))
+    setDismissedConnections(updated)
+    try {
+      window.localStorage.setItem(
+        DISMISSED_CONNECTIONS_KEY,
+        JSON.stringify(updated),
+      )
+    } catch {
+      setStorageWarning(true)
+    }
+
+    if (!thought.id || !speechSettings.apiKey) return
+    try {
+      await fetch(`${API_URL}/thoughts/dismiss`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${speechSettings.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          clientId: getClientId(),
+          sourceKey: `${ARTICLE_KEY}:${activeParagraphIndex}`,
+          thoughtId: thought.id,
+        }),
+      })
+    } catch {
+      // Keep the local dismissal even if the server is temporarily unavailable.
+    }
+  }
+
+  const returnToRelatedPassage = (index: number) => {
+    selectParagraph(index)
+    document
+      .querySelector<HTMLElement>(`[data-paragraph-index="${index}"]`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
 
   const selectVoiceWord = (wordIndex: number, extend = false) => {
@@ -872,7 +1326,7 @@ function App() {
         await context.resume()
         if (!voiceHoldRef.current) {
           socket.close()
-          void context.close()
+          void closeAudioContext(context)
           stream.getTracks().forEach((track) => track.stop())
           return
         }
@@ -942,7 +1396,7 @@ function App() {
               setIsLivePreview(false)
               liveCaptureRef.current = null
               socket.close()
-              void context.close()
+              void closeAudioContext(context)
               capture.stream.getTracks().forEach((track) => track.stop())
               return
             }
@@ -950,7 +1404,7 @@ function App() {
             setIsLivePreview(false)
             liveCaptureRef.current = null
             socket.close()
-            void context.close()
+            void closeAudioContext(context)
             capture.stream.getTracks().forEach((track) => track.stop())
           } else if (result.type === 'error') {
             setVoiceError(result.detail ?? 'Transcription failed.')
@@ -958,7 +1412,7 @@ function App() {
             setIsLivePreview(false)
             liveCaptureRef.current = null
             socket.close()
-            void context.close()
+            void closeAudioContext(context)
             capture.stream.getTracks().forEach((track) => track.stop())
           }
         }
@@ -968,7 +1422,7 @@ function App() {
             setVoiceState('error')
             setIsLivePreview(false)
             liveCaptureRef.current = null
-            void context.close()
+            void closeAudioContext(context)
             capture.stream.getTracks().forEach((track) => track.stop())
           }
         }
@@ -1120,7 +1574,7 @@ function App() {
       if (liveCapture.socket.readyState === WebSocket.OPEN) {
         liveCapture.socket.send('stop')
       }
-      void liveCapture.context.close()
+      void closeAudioContext(liveCapture.context)
       return
     }
     const recorder = recorderRef.current
@@ -1286,6 +1740,69 @@ function App() {
                 : 'Your thoughts will sit beside the words that sparked them.'}
             </p>
           </div>
+          {visibleRelatedThought && activeParagraphIndex !== null && (
+            <section
+              className="related-thought"
+              aria-label="A thought from your margins"
+            >
+              <div className="related-thought-heading">
+                <span className="related-thought-kicker">
+                  A THOUGHT RETURNS
+                </span>
+                <time dateTime={visibleRelatedThought.createdAt}>
+                  {new Intl.DateTimeFormat(undefined, {
+                    month: 'short',
+                    day: 'numeric',
+                  }).format(new Date(visibleRelatedThought.createdAt))}
+                </time>
+              </div>
+              <blockquote>{visibleRelatedThought.note}</blockquote>
+              <p className="related-thought-source">
+                From {visibleRelatedThought.articleTitle ?? ARTICLE_TITLE}
+              </p>
+              <div className="related-thought-actions">
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() =>
+                    returnToRelatedPassage(visibleRelatedThought.paragraphIndex)
+                  }
+                >
+                  Return to that passage <span aria-hidden="true">↗</span>
+                </button>
+                <button
+                  className="text-button text-button-subtle"
+                  type="button"
+                  onClick={() =>
+                    void dismissRelatedThought(visibleRelatedThought)
+                  }
+                >
+                  Not related
+                </button>
+              </div>
+            </section>
+          )}
+          {isMemoryPending && activeNote && (
+            <p className="memory-pending" role="status">
+              Looking through your margins…
+            </p>
+          )}
+          {hasMemoryError &&
+            activeParagraphIndex !== null &&
+            Object.values(notes).some((note) => note.trim()) && (
+              <p className="memory-error" role="status">
+                Your note is saved here. Margin connections are temporarily
+                unavailable.
+              </p>
+            )}
+          {!speechSettings.apiKey &&
+            activeParagraphIndex !== null &&
+            Object.keys(notes).length > 0 &&
+            !visibleRelatedThought && (
+              <p className="memory-pending">
+                Add an NVIDIA key in Settings to find returning thoughts.
+              </p>
+            )}
           {activeParagraphIndex !== null && (
             <button
               className={`voice-capture${voiceState === 'recording' ? ' is-recording' : ''}`}

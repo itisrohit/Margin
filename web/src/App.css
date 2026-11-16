@@ -688,6 +688,86 @@
   line-height: 1.5;
 }
 
+.related-thought {
+  margin: 0 0 16px;
+  padding: 13px 13px 12px;
+  border: 1px solid rgba(165, 150, 119, 0.24);
+  border-left: 2px solid #d9ad96;
+  border-radius: 3px 6px 6px 3px;
+  background: rgba(244, 240, 229, 0.72);
+  animation: margin-note-arrive 260ms ease-out both;
+}
+
+.related-thought-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: #a19a88;
+  font-size: 9px;
+}
+
+.related-thought-kicker {
+  color: #898476;
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.13em;
+}
+
+.related-thought blockquote {
+  margin: 11px 0 8px;
+  color: #554c3b;
+  font-family: 'Bradley Hand', 'Segoe Print', 'Comic Sans MS', cursive;
+  font-size: 16px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.related-thought-source {
+  margin: 0;
+  color: #9a9589;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.related-thought-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 9px;
+  border-top: 1px solid rgba(165, 150, 119, 0.16);
+}
+
+.related-thought-actions .text-button {
+  font-size: 9px;
+}
+
+.memory-pending,
+.memory-error {
+  margin: 0 0 12px;
+  color: #9a9589;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.memory-error {
+  color: #a36e58;
+}
+
+@keyframes margin-note-arrive {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .voice-edit-text {
   user-select: none;
 }
