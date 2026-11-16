@@ -2,12 +2,12 @@
 
 import re
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import DateTime, Index, String, delete, select
+from sqlalchemy import DateTime, Index, Integer, String, Text, delete, select, text
 from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.orm import Mapped, Session, mapped_column
 from starlette.concurrency import run_in_threadpool
@@ -28,6 +28,8 @@ class ChatRecord(Base):
     article_url: Mapped[str] = mapped_column(String(2048))
     title: Mapped[str] = mapped_column(String(300))
     turns: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    summary: Mapped[str] = mapped_column(Text, default="", server_default="")
+    summary_covers: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -49,6 +51,13 @@ class ChatTurn(BaseModel):
     sources: list[ChatSource] = Field(default_factory=list, max_length=24)
     status: Literal["streaming", "done", "stopped", "error"]
     error: str | None = Field(default=None, max_length=500)
+    follow_ups: list[Annotated[str, Field(max_length=140)]] = Field(
+        default_factory=list, alias="followUps", max_length=3
+    )
+    quote: str | None = Field(default=None, max_length=1500)
+    paragraph_index: int | None = Field(default=None, alias="paragraphIndex", ge=0)
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ChatInput(BaseModel):
@@ -58,7 +67,29 @@ class ChatInput(BaseModel):
     article_url: str = Field(alias="articleUrl", min_length=1, max_length=2048)
     title: str = Field(min_length=1, max_length=300)
     turns: list[ChatTurn] = Field(min_length=1, max_length=200)
+    summary: str = Field(default="", max_length=4000)
+    summary_covers: int = Field(default=0, alias="summaryCovers", ge=0)
     updated_at: datetime = Field(alias="updatedAt")
+
+
+_columns_ready = False
+
+
+def ensure_chat_schema() -> None:
+    """Create tables, and add columns introduced after a table already existed."""
+    global _columns_ready
+    ensure_schema()
+    if _columns_ready:
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE companion_chats "
+                "ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT '', "
+                "ADD COLUMN IF NOT EXISTS summary_covers INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+    _columns_ready = True
 
 
 def serialize(record: ChatRecord) -> dict[str, object]:
@@ -67,11 +98,13 @@ def serialize(record: ChatRecord) -> dict[str, object]:
         "title": record.title,
         "updatedAt": int(record.updated_at.timestamp() * 1000),
         "turns": record.turns,
+        "summary": record.summary or "",
+        "summaryCovers": record.summary_covers or 0,
     }
 
 
 def list_chats_sync(client_id: UUID, article_url: str) -> list[dict[str, object]]:
-    ensure_schema()
+    ensure_chat_schema()
     with Session(engine) as session:
         records = session.scalars(
             select(ChatRecord)
@@ -83,11 +116,11 @@ def list_chats_sync(client_id: UUID, article_url: str) -> list[dict[str, object]
 
 
 def save_chat_sync(chat_id: str, chat: ChatInput) -> None:
-    ensure_schema()
+    ensure_chat_schema()
     # An answer still streaming when saved is incomplete; store it as stopped.
     turns = [
         {
-            **turn.model_dump(by_alias=True),
+            **turn.model_dump(by_alias=True, exclude_none=True),
             "status": "stopped" if turn.status == "streaming" else turn.status,
         }
         for turn in chat.turns
@@ -99,6 +132,8 @@ def save_chat_sync(chat_id: str, chat: ChatInput) -> None:
         "article_url": chat.article_url,
         "title": chat.title[:300],
         "turns": turns,
+        "summary": chat.summary,
+        "summary_covers": chat.summary_covers,
         "updated_at": updated_at,
     }
     with Session(engine) as session:
@@ -107,7 +142,17 @@ def save_chat_sync(chat_id: str, chat: ChatInput) -> None:
             .values(**values)
             .on_conflict_do_update(
                 index_elements=["client_id", "id"],
-                set_={key: values[key] for key in ("article_url", "title", "turns", "updated_at")},
+                set_={
+                    key: values[key]
+                    for key in (
+                        "article_url",
+                        "title",
+                        "turns",
+                        "summary",
+                        "summary_covers",
+                        "updated_at",
+                    )
+                },
             )
         )
         stale = (
@@ -128,7 +173,7 @@ def save_chat_sync(chat_id: str, chat: ChatInput) -> None:
 
 
 def delete_chat_sync(client_id: UUID, chat_id: str) -> None:
-    ensure_schema()
+    ensure_chat_schema()
     with Session(engine) as session:
         session.execute(
             delete(ChatRecord).where(ChatRecord.client_id == client_id, ChatRecord.id == chat_id)

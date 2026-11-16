@@ -119,3 +119,50 @@ class ChatPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(listed), chats.MAX_CHATS_PER_ARTICLE)
         self.assertEqual(listed[0]["id"], f"chat-{chats.MAX_CHATS_PER_ARTICLE + 1}")
         self.assertNotIn("chat-0", [c["id"] for c in listed])
+
+
+@unittest.skipUnless(
+    os.getenv("RUN_POSTGRES_INTEGRATION") == "1",
+    "set RUN_POSTGRES_INTEGRATION=1 to run against local Postgres",
+)
+class ChatSummaryPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_summary_and_turn_extras_round_trip(self):
+        app = FastAPI()
+        app.include_router(chats.router)
+        client_id = str(uuid4())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://margin.test"
+        ) as client:
+            saved = await client.put(
+                "/companion/chats/with-summary",
+                json={
+                    "clientId": client_id,
+                    "articleUrl": "https://example.com",
+                    "title": "Q",
+                    "turns": [
+                        {
+                            "id": 1,
+                            "question": "Q",
+                            "answer": "A",
+                            "status": "done",
+                            "followUps": ["Next?"],
+                            "quote": "exact words",
+                            "paragraphIndex": 3,
+                        }
+                    ],
+                    "summary": "They discussed focus.",
+                    "summaryCovers": 4,
+                    "updatedAt": "2026-11-16T10:00:00Z",
+                },
+            )
+            self.assertEqual(saved.status_code, 200)
+            listed = await client.get(
+                "/companion/chats",
+                params={"clientId": client_id, "articleUrl": "https://example.com"},
+            )
+            [chat] = listed.json()["chats"]
+            self.assertEqual(chat["summary"], "They discussed focus.")
+            self.assertEqual(chat["summaryCovers"], 4)
+            self.assertEqual(chat["turns"][0]["followUps"], ["Next?"])
+            self.assertEqual(chat["turns"][0]["paragraphIndex"], 3)
+            await client.delete("/companion/chats/with-summary", params={"clientId": client_id})

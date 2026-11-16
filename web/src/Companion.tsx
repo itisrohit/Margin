@@ -7,6 +7,7 @@ import {
   useState,
   type ReactNode,
 } from 'react'
+import type React from 'react'
 
 type Article = { url: string; title: string; paragraphs: string[] }
 type Source = {
@@ -26,10 +27,56 @@ type Turn = {
   status: TurnStatus
   error?: string
   metrics?: Record<string, number | string | boolean>
+  followUps?: string[]
+  quote?: string
+  paragraphIndex?: number
 }
 export type VoiceQuestion = { text: string; id: number; releasedAt: number }
 
-type Chat = { id: string; title: string; updatedAt: number; turns: Turn[] }
+type Chat = {
+  id: string
+  title: string
+  updatedAt: number
+  turns: Turn[]
+  summary?: string
+  summaryCovers?: number
+}
+type ChatMemory = { summary: string; covers: number }
+export type AskQuote = { text: string; paragraphIndex: number; id: number }
+
+const SHOW_TIMINGS =
+  import.meta.env.DEV &&
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).has('debug')
+
+const QUICK_ACTIONS: { label: string; prompt: string; scope?: 'library' }[] = [
+  {
+    label: 'Explain simply',
+    prompt: 'Explain this in plain words, as simply as you can.',
+  },
+  {
+    label: 'Steelman the other side',
+    prompt: 'What is the strongest case against what the author says here?',
+  },
+  {
+    label: 'Key terms',
+    prompt:
+      'Which terms or ideas here should I understand better? Define them briefly.',
+  },
+  {
+    label: 'Connect to my reading',
+    prompt: 'How does this connect to other things I have read or noted?',
+    scope: 'library',
+  },
+]
+
+const plainAnswer = (answer: string) =>
+  answer
+    .replace(/\s?\[\d+\]/g, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/(^|[^*\w])[*_]([^*_\n]+)[*_](?=[^*\w]|$)/g, '$1$2')
+    .replace(/^#{1,6}\s+/gm, '')
+    .trim()
 
 const newChatId = () =>
   typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -39,7 +86,7 @@ const newChatId = () =>
 // Changes whenever a chat has something new worth sending to the server.
 const chatSignature = (chat: Chat) => {
   const last = chat.turns[chat.turns.length - 1]
-  return `${chat.updatedAt}:${chat.turns.length}:${last?.answer.length ?? 0}:${last?.status ?? ''}`
+  return `${chat.updatedAt}:${chat.turns.length}:${last?.answer.length ?? 0}:${last?.status ?? ''}:${last?.followUps?.length ?? 0}:${chat.summaryCovers ?? 0}`
 }
 
 function mergeChats(local: Chat[], remote: Chat[]): Chat[] {
@@ -119,6 +166,21 @@ function HistoryIcon() {
     <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
       <path
         d="M2.5 8a5.5 5.5 0 1 0 1.6-3.9M2.5 2.5v2.6h2.6M8 5v3.2l2 1.3"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
+function MicIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+      <path
+        d="M8 1.75a2.25 2.25 0 0 0-2.25 2.25v3.5a2.25 2.25 0 0 0 4.5 0V4A2.25 2.25 0 0 0 8 1.75ZM3.75 7.25a4.25 4.25 0 0 0 8.5 0M8 11.5v2.75"
         fill="none"
         stroke="currentColor"
         strokeWidth="1.4"
@@ -279,6 +341,12 @@ export function Companion({
   voiceQuestion,
   voiceDraft,
   onNavigate,
+  quote = null,
+  onClearQuote,
+  notes = {},
+  outline = [],
+  onSaveThought,
+  voice,
 }: {
   apiUrl: string
   apiKey: string
@@ -291,6 +359,22 @@ export function Companion({
   voiceQuestion: VoiceQuestion | null
   voiceDraft: string
   onNavigate: (source: Source) => void
+  quote?: AskQuote | null
+  onClearQuote?: () => void
+  notes?: Record<number, string>
+  outline?: string[]
+  onSaveThought?: (paragraphIndex: number, text: string) => void
+  voice?: {
+    handlers: {
+      onPointerDown: (event: React.PointerEvent) => void
+      onPointerUp: () => void
+      onPointerLeave: () => void
+      onPointerCancel: () => void
+    }
+    state: 'idle' | 'recording' | 'transcribing' | 'error'
+    error: string
+    hasKey: boolean
+  }
 }) {
   const [question, setQuestion] = useState('')
   const [scope, setScope] = useState<'passage' | 'library'>('passage')
@@ -303,6 +387,19 @@ export function Companion({
     () => chats.find((c) => c.id === chatId)?.turns ?? [],
   )
   const [showHistory, setShowHistory] = useState(false)
+  const [memory, setMemory] = useState<ChatMemory>(() => {
+    const chat = chats.find((c) => c.id === chatId)
+    return { summary: chat?.summary ?? '', covers: chat?.summaryCovers ?? 0 }
+  })
+  const memoryRef = useRef(memory)
+  const chatIdRef = useRef(chatId)
+  useEffect(() => {
+    chatIdRef.current = chatId
+  }, [chatId])
+  const summarizingRef = useRef(false)
+  const [savedTurnId, setSavedTurnId] = useState<number | null>(null)
+  const [copiedTurnId, setCopiedTurnId] = useState<number | null>(null)
+  const [openSources, setOpenSources] = useState<number | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [indexStatus, setIndexStatus] = useState('')
@@ -317,6 +414,17 @@ export function Companion({
   useEffect(() => {
     turnsRef.current = turns
   }, [turns])
+  useEffect(() => {
+    memoryRef.current = memory
+  }, [memory])
+  const notesRef = useRef(notes)
+  useEffect(() => {
+    notesRef.current = notes
+  }, [notes])
+  // A fresh highlight lands in the composer, ready for a question.
+  useEffect(() => {
+    if (quote) inputRef.current?.focus()
+  }, [quote])
   useEffect(() => () => controller.current?.abort(), [])
 
   // Save the open conversation into this article's history.
@@ -333,6 +441,8 @@ export function Companion({
               ? (previous.find((c) => c.id === chatId)?.updatedAt ?? Date.now())
               : Date.now(),
           turns: turns.map(({ metrics: _metrics, ...turn }) => turn),
+          summary: memory.summary,
+          summaryCovers: memory.covers,
         }
         const next = [chat, ...previous.filter((c) => c.id !== chatId)]
           .sort((a, b) => b.updatedAt - a.updatedAt)
@@ -342,7 +452,52 @@ export function Companion({
       })
     }, 300)
     return () => window.clearTimeout(timeout)
-  }, [turns, chatId, busy, article.url])
+  }, [turns, chatId, busy, article.url, memory])
+
+  // Fold turns that slid out of the memory window into a running summary.
+  useEffect(() => {
+    if (busy || !apiKey || summarizingRef.current) return
+    const answered = turns.filter((t) => t.answer)
+    const outOfWindow = answered.length - MAX_HISTORY_TURNS
+    if (outOfWindow <= memory.covers) return
+    const batch = answered.slice(
+      memory.covers,
+      Math.min(outOfWindow, memory.covers + 20),
+    )
+    const covers = memory.covers + batch.length
+    summarizingRef.current = true
+    const forChat = chatId
+    void (async () => {
+      try {
+        const response = await fetch(`${apiUrl}/companion/summarize`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            clientId,
+            title: article.title,
+            summary: memory.summary,
+            turns: batch.flatMap((t) => [
+              { role: 'user', content: t.question.slice(0, 2000) },
+              {
+                role: 'assistant',
+                content: plainAnswer(t.answer).slice(0, 6000),
+              },
+            ]),
+          }),
+        })
+        if (!response.ok) return
+        const { summary } = (await response.json()) as { summary: string }
+        if (chatIdRef.current === forChat) setMemory({ summary, covers })
+      } catch {
+        // Earlier questions still travel as a recap without a summary.
+      } finally {
+        summarizingRef.current = false
+      }
+    })()
+  }, [turns, busy, apiKey, apiUrl, clientId, article.title, memory, chatId])
 
   // Load this article's chats from the server and merge with the local cache.
   useEffect(() => {
@@ -396,6 +551,8 @@ export function Companion({
           articleUrl: article.url,
           title: chat.title.slice(0, 300),
           turns: chat.turns,
+          summary: chat.summary ?? '',
+          summaryCovers: chat.summaryCovers ?? 0,
           updatedAt: new Date(chat.updatedAt).toISOString(),
         }),
       })
@@ -489,7 +646,12 @@ export function Companion({
   const ask = useCallback(
     async (
       text: string,
-      options: { releasedAt?: number; scope?: 'passage' | 'library' } = {},
+      options: {
+        releasedAt?: number
+        scope?: 'passage' | 'library'
+        quote?: string
+        paragraphIndex?: number
+      } = {},
     ) => {
       const trimmed = text.trim()
       if (!trimmed) return
@@ -513,10 +675,23 @@ export function Companion({
           content: t.answer.replace(/\s?\[\d+\]/g, '').slice(0, 6000),
         },
       ])
+      const { summary, covers } = memoryRef.current
       const earlierQuestions = answered
-        .slice(0, -MAX_HISTORY_TURNS)
+        .slice(covers, Math.max(covers, answered.length - MAX_HISTORY_TURNS))
         .slice(-30)
         .map((t) => t.question.slice(0, 300))
+      const attachedQuote = options.quote ?? ''
+      const askIndex = options.paragraphIndex ?? paragraphIndex
+      const readerNotes = Object.entries(notesRef.current)
+        .map(([index, text]) => ({ paragraphIndex: Number(index), text }))
+        .filter((note) => note.text.trim())
+        .sort(
+          (a, b) =>
+            Math.abs(a.paragraphIndex - askIndex) -
+            Math.abs(b.paragraphIndex - askIndex),
+        )
+        .slice(0, 12)
+        .map((note) => ({ ...note, text: note.text.slice(0, 1000) }))
       const turnId = Date.now() + Math.random()
       pendingScrollId.current = turnId
       setBusy(true)
@@ -531,6 +706,8 @@ export function Companion({
           answer: '',
           sources: [],
           status: 'streaming',
+          paragraphIndex: askIndex,
+          ...(attachedQuote ? { quote: attachedQuote } : {}),
         },
       ])
       const update = (fn: (turn: Turn) => Turn) => {
@@ -540,7 +717,7 @@ export function Companion({
       }
       const live = () => controller.current === abort && !abort.signal.aborted
       try {
-        const start = Math.max(0, paragraphIndex - 2)
+        const start = Math.max(0, askIndex - 2)
         const response = await fetch(`${apiUrl}/companion/ask`, {
           method: 'POST',
           signal: abort.signal,
@@ -553,10 +730,14 @@ export function Companion({
             question: trimmed,
             articleUrl: article.url,
             title: article.title,
-            paragraphIndex,
+            paragraphIndex: askIndex,
             contextStart: start,
-            context: article.paragraphs.slice(start, paragraphIndex + 3),
+            context: article.paragraphs.slice(start, askIndex + 3),
             scope: activeScope,
+            summary,
+            quote: attachedQuote,
+            notes: readerNotes,
+            outline,
             history,
             earlierQuestions,
           }),
@@ -573,6 +754,8 @@ export function Companion({
           if (!line.trim() || !live()) return
           const event = JSON.parse(line)
           if (event.type === 'error') throw new Error(event.detail)
+          if (event.type === 'followups')
+            update((t) => ({ ...t, followUps: event.questions }))
           if (event.type === 'sources')
             update((t) => ({ ...t, sources: event.sources }))
           if (event.type === 'delta') {
@@ -625,14 +808,51 @@ export function Companion({
         if (controller.current === abort) setBusy(false)
       }
     },
-    [apiKey, apiUrl, article, clientId, paragraphIndex, scope],
+    [apiKey, apiUrl, article, clientId, paragraphIndex, scope, outline],
   )
 
   useEffect(() => {
     if (!voiceQuestion || voiceQuestion.id === lastVoice.current) return
     lastVoice.current = voiceQuestion.id
-    void ask(voiceQuestion.text, { releasedAt: voiceQuestion.releasedAt })
-  }, [voiceQuestion, ask])
+    send(voiceQuestion.text, { releasedAt: voiceQuestion.releasedAt })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voiceQuestion])
+
+  const send = (
+    text: string,
+    options: { scope?: 'passage' | 'library'; releasedAt?: number } = {},
+  ) => {
+    void ask(text, {
+      ...options,
+      ...(quote
+        ? { quote: quote.text, paragraphIndex: quote.paragraphIndex }
+        : {}),
+    })
+    if (quote) onClearQuote?.()
+  }
+
+  const saveToMargin = (turn: Turn) => {
+    if (!onSaveThought) return
+    onSaveThought(
+      turn.paragraphIndex ?? paragraphIndex,
+      plainAnswer(turn.answer),
+    )
+    setSavedTurnId(turn.id)
+    window.setTimeout(
+      () => setSavedTurnId((id) => (id === turn.id ? null : id)),
+      2400,
+    )
+  }
+
+  const copyAnswer = (turn: Turn) => {
+    void navigator.clipboard?.writeText(plainAnswer(turn.answer)).then(() => {
+      setCopiedTurnId(turn.id)
+      window.setTimeout(
+        () => setCopiedTurnId((id) => (id === turn.id ? null : id)),
+        1600,
+      )
+    })
+  }
 
   const stop = () => {
     controller.current?.abort()
@@ -645,13 +865,17 @@ export function Companion({
     const remaining = turnsRef.current.filter((t) => t.id !== turn.id)
     turnsRef.current = remaining
     setTurns(remaining)
-    void ask(turn.question)
+    void ask(turn.question, {
+      quote: turn.quote,
+      paragraphIndex: turn.paragraphIndex,
+    })
   }
 
   const startNewChat = () => {
     stop()
     setChatId(newChatId())
     setTurns([])
+    setMemory({ summary: '', covers: 0 })
     setError('')
     setShowHistory(false)
     inputRef.current?.focus()
@@ -662,6 +886,7 @@ export function Companion({
     setChatId(chat.id)
     turnsRef.current = chat.turns
     setTurns(chat.turns)
+    setMemory({ summary: chat.summary ?? '', covers: chat.summaryCovers ?? 0 })
     setError('')
     setShowHistory(false)
     pendingScrollId.current = chat.turns[chat.turns.length - 1]?.id ?? null
@@ -702,21 +927,11 @@ export function Companion({
       hidden={hidden}
     >
       <header className="companion-header">
-        <div className="companion-scope" role="group" aria-label="Answer from">
-          <button
-            type="button"
-            aria-pressed={scope === 'passage'}
-            onClick={() => setScope('passage')}
-          >
-            This passage
-          </button>
-          <button
-            type="button"
-            aria-pressed={scope === 'library'}
-            onClick={() => setScope('library')}
-          >
-            My library
-          </button>
+        <div className="companion-title">
+          <span className="companion-title-mark" aria-hidden="true">
+            ✳
+          </span>
+          {showHistory ? 'Your chats' : 'Ask Margin'}
         </div>
         <button
           type="button"
@@ -744,13 +959,23 @@ export function Companion({
       </header>
       <p className="companion-context" role="status">
         {scope === 'library' ? (
-          indexStatus || 'Answers will draw on everything you’ve saved.'
+          <>
+            <strong>Across your library</strong>
+            {indexStatus ? ` · ${indexStatus}` : ''}
+          </>
         ) : passageLabel ? (
           <>
-            Focused on <strong>{passageLabel}</strong>
+            <strong>About {passageLabel}</strong>
+            {article.paragraphs[paragraphIndex] && (
+              <span className="companion-context-snippet">
+                {' '}
+                · “{article.paragraphs[paragraphIndex].slice(0, 90)}
+                {article.paragraphs[paragraphIndex].length > 90 ? '…' : ''}”
+              </span>
+            )}
           </>
         ) : (
-          'Tap a passage in the article to focus your question.'
+          'Hover or tap a passage to focus your question — or select words to ask about them.'
         )}
       </p>
 
@@ -828,7 +1053,7 @@ export function Companion({
                     key={s.text}
                     onClick={() => {
                       if (s.scope) setScope(s.scope)
-                      void ask(s.text, { scope: s.scope })
+                      send(s.text, { scope: s.scope })
                     }}
                   >
                     {s.text}
@@ -843,7 +1068,14 @@ export function Companion({
                 key={turn.id}
                 data-turn-id={turn.id}
               >
-                <p className="companion-question">{turn.question}</p>
+                <div className="companion-ask">
+                  {turn.quote && (
+                    <blockquote className="companion-turn-quote">
+                      “{turn.quote}”
+                    </blockquote>
+                  )}
+                  <p className="companion-question">{turn.question}</p>
+                </div>
                 <div className="companion-answer">
                   {turn.answer ? (
                     renderAnswer(turn.answer, turn.sources, onNavigate)
@@ -881,42 +1113,93 @@ export function Companion({
                   </div>
                 )}
 
-                {!!turn.sources.length && turn.status !== 'streaming' && (
-                  <details className="companion-evidence">
-                    <summary>
-                      {turn.sources.length}{' '}
-                      {turn.sources.length === 1 ? 'source' : 'sources'}
-                    </summary>
-                    <div className="companion-evidence-list">
-                      {turn.sources.map((source) => (
+                {turn.status !== 'streaming' &&
+                  (turn.answer || turn.sources.length > 0) && (
+                    <div className="companion-turn-actions">
+                      {onSaveThought && turn.status === 'done' && (
                         <button
-                          key={source.id}
                           type="button"
-                          onClick={() => onNavigate(source)}
+                          onClick={() => saveToMargin(turn)}
+                          disabled={savedTurnId === turn.id}
+                          title="Add this answer to your thought on the passage"
                         >
-                          <span className="companion-evidence-id">
-                            {source.id}
+                          {savedTurnId === turn.id
+                            ? `Saved to passage ${(turn.paragraphIndex ?? paragraphIndex) + 1} ✓`
+                            : '✎ Save to margin'}
+                        </button>
+                      )}
+                      {turn.answer && (
+                        <button type="button" onClick={() => copyAnswer(turn)}>
+                          {copiedTurnId === turn.id ? 'Copied ✓' : 'Copy'}
+                        </button>
+                      )}
+                      {turn.sources.length > 0 && (
+                        <button
+                          type="button"
+                          className="companion-sources-toggle"
+                          aria-expanded={openSources === turn.id}
+                          onClick={() =>
+                            setOpenSources((id) =>
+                              id === turn.id ? null : turn.id,
+                            )
+                          }
+                        >
+                          {turn.sources.length}{' '}
+                          {turn.sources.length === 1 ? 'source' : 'sources'}
+                          <span aria-hidden="true">›</span>
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                {openSources === turn.id && (
+                  <div className="companion-evidence-list">
+                    {turn.sources.map((source) => (
+                      <button
+                        key={source.id}
+                        type="button"
+                        onClick={() => onNavigate(source)}
+                      >
+                        <span className="companion-evidence-id">
+                          {source.id}
+                        </span>
+                        <span className="companion-evidence-body">
+                          <strong>
+                            {source.kind === 'thought' ? 'Your thought · ' : ''}
+                            {source.title}
+                          </strong>
+                          <span>
+                            {source.text.length > 160
+                              ? `${source.text.slice(0, 160).trimEnd()}…`
+                              : source.text}
                           </span>
-                          <span className="companion-evidence-body">
-                            <strong>
-                              {source.kind === 'thought'
-                                ? 'Your thought · '
-                                : ''}
-                              {source.title}
-                            </strong>
-                            <span>
-                              {source.text.length > 160
-                                ? `${source.text.slice(0, 160).trimEnd()}…`
-                                : source.text}
-                            </span>
-                          </span>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {i === lastIndex &&
+                  turn.status === 'done' &&
+                  !!turn.followUps?.length && (
+                    <div
+                      className="companion-followups"
+                      aria-label="Suggested follow-ups"
+                    >
+                      {turn.followUps.map((followUp) => (
+                        <button
+                          type="button"
+                          key={followUp}
+                          onClick={() => send(followUp)}
+                          disabled={busy}
+                        >
+                          {followUp}
                         </button>
                       ))}
                     </div>
-                  </details>
-                )}
+                  )}
 
-                {import.meta.env.DEV && turn.metrics && (
+                {SHOW_TIMINGS && turn.metrics && (
                   <details className="companion-metrics">
                     <summary>Response timings (dev)</summary>
                     <pre>{JSON.stringify(turn.metrics, null, 2)}</pre>
@@ -941,10 +1224,42 @@ export function Companion({
         className="companion-composer"
         onSubmit={(e) => {
           e.preventDefault()
-          if (canSend) void ask(question)
+          if (canSend) send(question)
         }}
       >
-        <div className={`companion-input${voiceDraft ? ' is-listening' : ''}`}>
+        {quote && (
+          <div className="companion-quote-chip">
+            <span className="companion-quote-label">Asking about</span>
+            <span className="companion-quote-text">“{quote.text}”</span>
+            <button
+              type="button"
+              aria-label="Remove highlighted text"
+              title="Remove"
+              onClick={onClearQuote}
+            >
+              ×
+            </button>
+          </div>
+        )}
+        {turns.length > 0 && !busy && !question && !voiceDraft && (
+          <div className="companion-quick" aria-label="Quick questions">
+            {QUICK_ACTIONS.map((action) => (
+              <button
+                type="button"
+                key={action.label}
+                onClick={() => {
+                  if (action.scope) setScope(action.scope)
+                  send(action.prompt, { scope: action.scope })
+                }}
+              >
+                {action.label}
+              </button>
+            ))}
+          </div>
+        )}
+        <div
+          className={`companion-input${voiceDraft || voice?.state === 'recording' ? ' is-listening' : ''}`}
+        >
           <textarea
             id="companion-question"
             ref={inputRef}
@@ -956,9 +1271,17 @@ export function Companion({
             }
             onChange={(e) => setQuestion(e.target.value)}
             placeholder={
-              turns.length
-                ? 'Ask a follow-up…'
-                : 'What does the author mean here?'
+              voice?.hasKey
+                ? quote
+                  ? 'Ask about this — or hold Space to speak'
+                  : turns.length
+                    ? 'Ask a follow-up — or hold Space to speak'
+                    : 'Ask anything — or hold Space to speak'
+                : quote
+                  ? 'What do you want to know about this?'
+                  : turns.length
+                    ? 'Ask a follow-up…'
+                    : 'What does the author mean here?'
             }
             rows={1}
             onKeyDown={(event) => {
@@ -968,39 +1291,91 @@ export function Companion({
                 !event.nativeEvent.isComposing
               ) {
                 event.preventDefault()
-                if (canSend) void ask(question)
+                if (canSend) send(question)
               } else if (event.key === 'Escape') {
                 event.currentTarget.blur()
               }
             }}
           />
-          {busy && !canSend ? (
-            <button
-              type="button"
-              className="companion-send is-stop"
-              onClick={stop}
-              aria-label="Stop answering"
-              title="Stop"
+          <div className="companion-input-bar">
+            <div
+              className="companion-scope"
+              role="group"
+              aria-label="Answer from"
             >
-              <span aria-hidden="true">■</span>
-            </button>
-          ) : (
-            <button
-              type="submit"
-              className="companion-send"
-              disabled={!canSend}
-              aria-label="Ask Margin"
-              title="Ask (Enter)"
-            >
-              <span aria-hidden="true">↑</span>
-            </button>
-          )}
+              <button
+                type="button"
+                aria-pressed={scope === 'passage'}
+                onClick={() => setScope('passage')}
+                title="Answer from this passage and its surroundings"
+              >
+                Passage
+              </button>
+              <button
+                type="button"
+                aria-pressed={scope === 'library'}
+                onClick={() => setScope('library')}
+                title="Answer from everything you've saved"
+              >
+                Library
+              </button>
+            </div>
+            {voice && (
+              <button
+                type="button"
+                className={`companion-mic${voice.state === 'recording' ? ' is-recording' : ''}`}
+                aria-label={
+                  voice.hasKey ? 'Hold to ask by voice' : 'Add a key to speak'
+                }
+                title={
+                  voice.hasKey
+                    ? 'Hold to speak (or hold Space)'
+                    : 'Add an NVIDIA key in Settings to speak'
+                }
+                aria-pressed={voice.state === 'recording'}
+                disabled={voice.state === 'transcribing'}
+                {...voice.handlers}
+              >
+                <MicIcon />
+              </button>
+            )}
+            {busy && !canSend ? (
+              <button
+                type="button"
+                className="companion-send is-stop"
+                onClick={stop}
+                aria-label="Stop answering"
+                title="Stop"
+              >
+                <span aria-hidden="true">■</span>
+              </button>
+            ) : (
+              <button
+                type="submit"
+                className="companion-send"
+                disabled={!canSend}
+                aria-label="Ask Margin"
+                title="Ask (Enter)"
+              >
+                <span aria-hidden="true">↑</span>
+              </button>
+            )}
+          </div>
         </div>
-        <p className="companion-hint">
-          {voiceDraft
-            ? 'Listening…'
-            : 'Enter to ask · Shift+Enter for a new line · Esc, then hold Space to speak'}
-        </p>
+        {(voiceDraft || (voice && voice.state !== 'idle')) && (
+          <p
+            className={`companion-hint${voice?.state === 'error' ? ' has-error' : ''}`}
+            role="status"
+          >
+            {voice?.state === 'recording'
+              ? 'Listening — release to ask.'
+              : voice?.state === 'transcribing'
+                ? 'Finishing your question…'
+                : voice?.state === 'error'
+                  ? voice.error
+                  : 'Listening…'}
+          </p>
+        )}
       </form>
       {error && (
         <p role="alert" className="companion-error">

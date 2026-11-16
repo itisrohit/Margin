@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type React from 'react'
 import './App.css'
 import { ArticleOutline } from './ArticleOutline'
 import { Companion, type VoiceQuestion } from './Companion'
@@ -738,6 +739,17 @@ function App() {
   const [libraryOpen, setLibraryOpen] = useState(false)
   const [captureMode, setCaptureMode] = useState<'thought' | 'ask'>('thought')
   const [hasOpenedAsk, setHasOpenedAsk] = useState(false)
+  const [askQuote, setAskQuote] = useState<{
+    text: string
+    paragraphIndex: number
+    id: number
+  } | null>(null)
+  const [selectionMenu, setSelectionMenu] = useState<{
+    text: string
+    paragraphIndex: number
+    top: number
+    left: number
+  } | null>(null)
   const [voiceQuestion, setVoiceQuestion] = useState<VoiceQuestion | null>(null)
   const [voiceDraft, setVoiceDraft] = useState('')
   const releasedAtRef = useRef(0)
@@ -887,6 +899,12 @@ function App() {
   }
 
   const focusedParagraphIndex = activeParagraphIndex
+  const articleOutline = importedArticle?.blocks
+    ? importedArticle.blocks
+        .filter((block) => block.type === 'heading')
+        .map((block) => block.text)
+        .slice(0, 40)
+    : []
   const focusedParagraph =
     focusedParagraphIndex === null ? null : paragraphs[focusedParagraphIndex]
   const activeNote =
@@ -1799,11 +1817,76 @@ function App() {
     if (recorder && recorder.state !== 'inactive') recorder.stop()
   }, [])
 
+  // Selecting words in the article offers to ask about, or note, exactly them.
+  useEffect(() => {
+    let timeout = 0
+    const update = () => {
+      window.clearTimeout(timeout)
+      timeout = window.setTimeout(() => {
+        const selection = window.getSelection()
+        const text = selection?.toString().replace(/\s+/g, ' ').trim() ?? ''
+        if (!selection || selection.rangeCount === 0 || text.length < 3) {
+          setSelectionMenu(null)
+          return
+        }
+        const range = selection.getRangeAt(0)
+        const node =
+          range.commonAncestorContainer instanceof Element
+            ? range.commonAncestorContainer
+            : range.commonAncestorContainer.parentElement
+        const paragraph = node?.closest<HTMLElement>('[data-paragraph-index]')
+        if (!paragraph) {
+          setSelectionMenu(null)
+          return
+        }
+        // Snap the selection out to whole words.
+        const full = paragraph.textContent ?? ''
+        const prefix = document.createRange()
+        prefix.selectNodeContents(paragraph)
+        prefix.setEnd(range.startContainer, range.startOffset)
+        let start = prefix.toString().length
+        let end = start + range.toString().length
+        const isWord = (char: string | undefined) =>
+          !!char && /[\p{L}\p{N}'’-]/u.test(char)
+        while (start > 0 && isWord(full[start - 1]) && isWord(full[start]))
+          start -= 1
+        while (end < full.length && isWord(full[end]) && isWord(full[end - 1]))
+          end += 1
+        const snapped = full.slice(start, end).replace(/\s+/g, ' ').trim()
+        const rect = range.getBoundingClientRect()
+        setSelectionMenu({
+          text: (snapped || text).slice(0, 1500),
+          paragraphIndex: Number(paragraph.dataset.paragraphIndex),
+          top: Math.max(8, rect.top - 46),
+          left: Math.min(
+            window.innerWidth - 120,
+            Math.max(120, rect.left + rect.width / 2),
+          ),
+        })
+      }, 150)
+    }
+    const hide = () => setSelectionMenu(null)
+    document.addEventListener('selectionchange', update)
+    window.addEventListener('scroll', hide, { passive: true })
+    return () => {
+      window.clearTimeout(timeout)
+      document.removeEventListener('selectionchange', update)
+      window.removeEventListener('scroll', hide)
+    }
+  }, [])
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.code !== 'Space') return
       const target = event.target
+      // An empty Ask box can't need a leading space, so Space means "speak".
+      const isEmptyAskBox =
+        target instanceof HTMLTextAreaElement &&
+        target.id === 'companion-question' &&
+        !target.value.trim() &&
+        !event.shiftKey
       if (
+        !isEmptyAskBox &&
         target instanceof HTMLElement &&
         target.closest('input, textarea, select, [contenteditable="true"]')
       )
@@ -1861,6 +1944,29 @@ function App() {
     voiceState,
     voiceEditSelection,
   ])
+
+  const releaseVoiceHold = () => {
+    if (holdSourceRef.current === 'pointer') {
+      holdSourceRef.current = null
+      stopVoiceCapture()
+    }
+  }
+  const voicePointerHandlers = {
+    onPointerDown: (event: React.PointerEvent) => {
+      event.preventDefault()
+      if (!speechSettings.apiKey) {
+        setSettingsDraft(speechSettings)
+        setIsSettingsOpen(true)
+        return
+      }
+      voiceHoldRef.current = true
+      holdSourceRef.current = 'pointer'
+      void startVoiceCapture()
+    },
+    onPointerUp: releaseVoiceHold,
+    onPointerLeave: releaseVoiceHold,
+    onPointerCancel: releaseVoiceHold,
+  }
 
   return (
     <div
@@ -2095,7 +2201,14 @@ function App() {
                   onFocus={() => selectParagraph(index)}
                   onBlur={(event) => {
                     const reader = event.currentTarget.closest('.reader-layout')
-                    if (!reader?.contains(event.relatedTarget as Node | null)) {
+                    const next = event.relatedTarget as HTMLElement | null
+                    // Opening the margin (or its toolbar) keeps the passage.
+                    if (
+                      !reader?.contains(next) &&
+                      !next?.closest(
+                        '.mobile-margin-toggle, .selection-menu, .settings-backdrop',
+                      )
+                    ) {
                       setActiveParagraphIndex(null)
                     }
                   }}
@@ -2154,6 +2267,25 @@ function App() {
             {hasOpenedAsk && (
               <Companion
                 hidden={captureMode !== 'ask'}
+                voice={{
+                  handlers: voicePointerHandlers,
+                  state: voiceState,
+                  error: voiceState === 'error' ? voiceError : '',
+                  hasKey: Boolean(speechSettings.apiKey),
+                }}
+                quote={askQuote}
+                onClearQuote={() => setAskQuote(null)}
+                notes={notes}
+                outline={articleOutline}
+                onSaveThought={(paragraphIndex, text) => {
+                  const updated = appendTranscript(
+                    notes[paragraphIndex] ?? '',
+                    text,
+                  )
+                  persistNotes({ ...notes, [paragraphIndex]: updated })
+                  if (paragraphIndex === activeParagraphIndex)
+                    setNoteDraft(updated)
+                }}
                 passageLabel={
                   activeParagraphIndex === null
                     ? null
@@ -2192,179 +2324,67 @@ function App() {
                 }}
               />
             )}
-            <div className="rail-heading">
-              <span className="rail-label">
-                {focusedParagraph ? 'IN FOCUS' : 'YOUR MARGIN'}
-              </span>
-              <span className="rail-count">
-                {focusedParagraphIndex === null
-                  ? '—'
-                  : `${String(focusedParagraphIndex + 1).padStart(2, '0')} / ${String(paragraphs.length).padStart(2, '0')}`}
-              </span>
-            </div>
-            <div className="rail-empty">
-              <span className="rail-spark" aria-hidden="true">
-                ✳
-              </span>
-              <p className="rail-title">
-                {focusedParagraph
-                  ? `Passage ${focusedParagraphIndex! + 1}`
-                  : 'A little room to think.'}
-              </p>
-              <p className="rail-copy">
-                {focusedParagraph
-                  ? `“${focusedParagraph.slice(0, 100)}${focusedParagraph.length > 100 ? '…' : ''}”`
-                  : 'Your thoughts will sit beside the words that sparked them.'}
-              </p>
-            </div>
-            {visibleRelatedThought && activeParagraphIndex !== null && (
-              <section
-                className="related-thought"
-                aria-label="A thought from your margins"
-              >
-                <div className="related-thought-heading">
-                  <span className="related-thought-kicker">
-                    A THOUGHT RETURNS
+            {focusedParagraph ? (
+              <div className="thought-focus">
+                <div className="thought-focus-heading">
+                  <span className="rail-label">
+                    Passage {focusedParagraphIndex! + 1}
                   </span>
-                  <time dateTime={visibleRelatedThought.createdAt}>
-                    {new Intl.DateTimeFormat(undefined, {
-                      month: 'short',
-                      day: 'numeric',
-                    }).format(new Date(visibleRelatedThought.createdAt))}
-                  </time>
+                  <span className="rail-count">
+                    {String(focusedParagraphIndex! + 1).padStart(2, '0')} /{' '}
+                    {String(paragraphs.length).padStart(2, '0')}
+                  </span>
                 </div>
-                <blockquote>{visibleRelatedThought.note}</blockquote>
-                <p className="related-thought-source">
-                  From {visibleRelatedThought.articleTitle ?? ARTICLE_TITLE}
+                <blockquote className="thought-focus-quote">
+                  {focusedParagraph}
+                </blockquote>
+              </div>
+            ) : (
+              <div className="thought-empty">
+                <p className="thought-empty-title">A little room to think.</p>
+                <p className="thought-empty-copy">
+                  Tap any passage to leave a thought beside it — typed, or
+                  spoken by holding <kbd>Space</kbd>.
                 </p>
-                <div className="related-thought-actions">
-                  <button
-                    className="text-button"
-                    type="button"
-                    onClick={() =>
-                      returnToRelatedPassage(
-                        visibleRelatedThought.paragraphIndex,
-                      )
-                    }
-                  >
-                    Return to that passage <span aria-hidden="true">↗</span>
-                  </button>
-                  <button
-                    className="text-button text-button-subtle"
-                    type="button"
-                    onClick={() =>
-                      void dismissRelatedThought(visibleRelatedThought)
-                    }
-                  >
-                    Not related
-                  </button>
-                </div>
-              </section>
-            )}
-            {isMemoryPending && activeNote && (
-              <p className="memory-pending" role="status">
-                Looking through your margins…
-              </p>
-            )}
-            {hasMemoryError &&
-              activeParagraphIndex !== null &&
-              Object.values(notes).some((note) => note.trim()) && (
-                <p className="memory-error" role="status">
-                  Your note is saved here. Margin connections are temporarily
-                  unavailable.
-                </p>
-              )}
-            {!speechSettings.apiKey &&
-              activeParagraphIndex !== null &&
-              Object.keys(notes).length > 0 &&
-              !visibleRelatedThought && (
-                <p className="memory-pending">
-                  Add an NVIDIA key in Settings to find returning thoughts.
-                </p>
-              )}
-            {(activeParagraphIndex !== null || captureMode === 'ask') && (
-              <button
-                className={`voice-capture${voiceState === 'recording' ? ' is-recording' : ''}`}
-                type="button"
-                aria-pressed={voiceState === 'recording'}
-                disabled={
-                  voiceState === 'transcribing' ||
-                  isEditingNote ||
-                  (isVoiceEditing && !voiceEditSelection)
-                }
-                onPointerDown={(event) => {
-                  event.preventDefault()
-                  if (!speechSettings.apiKey) {
-                    setSettingsDraft(speechSettings)
-                    setIsSettingsOpen(true)
-                    return
-                  }
-                  voiceHoldRef.current = true
-                  holdSourceRef.current = 'pointer'
-                  void startVoiceCapture()
-                }}
-                onPointerUp={() => {
-                  if (holdSourceRef.current === 'pointer') {
-                    holdSourceRef.current = null
-                    stopVoiceCapture()
-                  }
-                }}
-                onPointerLeave={() => {
-                  if (holdSourceRef.current === 'pointer') {
-                    holdSourceRef.current = null
-                    stopVoiceCapture()
-                  }
-                }}
-                onPointerCancel={() => {
-                  if (holdSourceRef.current === 'pointer') {
-                    holdSourceRef.current = null
-                    stopVoiceCapture()
-                  }
-                }}
-              >
-                <span className="voice-indicator" aria-hidden="true" />
-                {voiceState === 'recording'
-                  ? isVoiceEditing
-                    ? 'Release to replace selection'
-                    : captureMode === 'ask'
-                      ? 'Release to ask Margin'
-                      : 'Release to finish thought'
-                  : voiceState === 'transcribing'
-                    ? 'Transcribing…'
-                    : isVoiceEditing
-                      ? voiceEditSelection
-                        ? 'Hold to replace selection'
-                        : 'Choose a word to edit'
-                      : speechSettings.apiKey
-                        ? captureMode === 'ask'
-                          ? 'Hold to ask Margin'
-                          : 'Hold to speak a thought'
-                        : 'Add API key to speak'}
-              </button>
-            )}
-            {voiceState !== 'idle' && (
-              <div
-                className={`voice-status${voiceState === 'error' ? ' has-error' : ''}`}
-                role="status"
-              >
-                {voiceState === 'recording'
-                  ? isVoiceEditing
-                    ? 'Listening — release to replace the selected words.'
-                    : captureMode === 'ask'
-                      ? 'Listening — release to ask Margin.'
-                      : 'Listening — release to finish your thought.'
-                  : voiceState === 'transcribing'
-                    ? captureMode === 'ask'
-                      ? 'Finishing your question…'
-                      : 'Writing your thought in the margin…'
-                    : voiceError}
+                {Object.keys(notes).length > 0 && (
+                  <div className="thought-list">
+                    <p className="rail-label">
+                      Your thoughts here · {Object.keys(notes).length}
+                    </p>
+                    <ul>
+                      {Object.entries(notes)
+                        .map(([index, note]) => [Number(index), note] as const)
+                        .sort(([a], [b]) => a - b)
+                        .map(([index, note]) => (
+                          <li key={index}>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                selectParagraph(index)
+                                document
+                                  .querySelector(
+                                    `[data-paragraph-index="${index}"]`,
+                                  )
+                                  ?.scrollIntoView({
+                                    behavior: 'smooth',
+                                    block: 'center',
+                                  })
+                              }}
+                            >
+                              <span className="thought-list-passage">
+                                Passage {index + 1}
+                              </span>
+                              <span className="thought-list-note">{note}</span>
+                            </button>
+                          </li>
+                        ))}
+                    </ul>
+                  </div>
+                )}
               </div>
             )}
-            {activeParagraphIndex === null ? (
-              <p className="rail-footnote">
-                Select a passage to attach a note.
-              </p>
-            ) : isLivePreview && noteDraft ? (
+            {activeParagraphIndex === null ? null : isLivePreview &&
+              noteDraft ? (
               <div className="saved-note live-note">
                 <div className="saved-note-header">
                   <p className="saved-note-label">
@@ -2381,7 +2401,16 @@ function App() {
                     {isVoiceEditing ? 'EDITING BY VOICE' : 'YOUR THOUGHT'}
                   </p>
                   <span className="saved-note-status">
-                    {isVoiceEditing ? 'SELECT A WORD' : 'SAVED'}
+                    {isVoiceEditing
+                      ? 'SELECT A WORD'
+                      : thoughtDates[activeParagraphIndex]
+                        ? new Intl.DateTimeFormat(undefined, {
+                            month: 'short',
+                            day: 'numeric',
+                          }).format(
+                            new Date(thoughtDates[activeParagraphIndex]),
+                          )
+                        : 'SAVED'}
                   </span>
                 </div>
                 {isVoiceEditing ? (
@@ -2568,6 +2597,17 @@ function App() {
                           className="text-button"
                           type="button"
                           onClick={() => {
+                            setNoteDraft(activeNote)
+                            setIsEditingNote(true)
+                          }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          className="text-button"
+                          type="button"
+                          hidden={!speechSettings.apiKey}
+                          onClick={() => {
                             setIsVoiceEditing(true)
                             setVoiceEditSelection(null)
                             setIsExtendingSelection(false)
@@ -2578,17 +2618,7 @@ function App() {
                           Edit by voice
                         </button>
                         <button
-                          className="text-button text-button-subtle"
-                          type="button"
-                          onClick={() => {
-                            setNoteDraft(activeNote)
-                            setIsEditingNote(true)
-                          }}
-                        >
-                          Edit with keyboard
-                        </button>
-                        <button
-                          className="text-button danger"
+                          className="text-button danger note-delete"
                           type="button"
                           onClick={() => setConfirmingDelete(true)}
                         >
@@ -2624,7 +2654,7 @@ function App() {
                     <span className="composer-pencil" aria-hidden="true">
                       ✎
                     </span>
-                    EDIT YOUR THOUGHT
+                    {activeNote ? 'EDIT YOUR THOUGHT' : 'NEW THOUGHT'}
                   </label>
                   <button
                     className="text-button"
@@ -2637,30 +2667,50 @@ function App() {
                     Cancel
                   </button>
                 </div>
-                <p className="composer-guidance">
-                  Keep the words that still sound like you. Your note changes
-                  only when you save.
-                </p>
+                {activeNote && (
+                  <p className="composer-guidance">
+                    Your thought changes only when you save.
+                  </p>
+                )}
                 <textarea
                   id="note-draft"
                   autoFocus
                   value={noteDraft}
                   onChange={(event) => setNoteDraft(event.target.value)}
                   placeholder="What did this passage make you think?"
-                  rows={5}
+                  rows={4}
+                  onKeyDown={(event) => {
+                    if (
+                      event.key === 'Enter' &&
+                      (event.metaKey || event.ctrlKey)
+                    ) {
+                      event.preventDefault()
+                      event.currentTarget.form?.requestSubmit()
+                    } else if (event.key === 'Escape') {
+                      event.preventDefault()
+                      setNoteDraft(activeNote ?? '')
+                      setIsEditingNote(false)
+                    }
+                  }}
                 />
                 <div className="composer-footer">
                   <p className="storage-note">
-                    {storageWarning
-                      ? 'Browser storage is unavailable.'
-                      : 'This stays in your browser.'}
+                    {storageWarning ? (
+                      'Browser storage is unavailable.'
+                    ) : (
+                      <>
+                        <kbd>⌘↵</kbd> save · <kbd>Esc</kbd> cancel
+                      </>
+                    )}
                   </p>
                   <button
                     className="save-note"
                     type="submit"
-                    disabled={!noteDraft.trim()}
+                    disabled={
+                      !noteDraft.trim() || noteDraft.trim() === activeNote
+                    }
                   >
-                    Save changes <span aria-hidden="true">↗</span>
+                    {activeNote ? 'Save changes' : 'Save thought'}
                   </button>
                 </div>
               </form>
@@ -2673,14 +2723,184 @@ function App() {
                   setIsEditingNote(true)
                 }}
               >
-                <span aria-hidden="true">✎</span> Leave a thought
+                <span className="add-note-prompt">
+                  What did this passage make you think?
+                </span>
+                <span className="add-note-hint">
+                  Click to write
+                  {speechSettings.apiKey ? ' · or hold Space to speak' : ''}
+                </span>
               </button>
             )}
+            {(activeParagraphIndex !== null || captureMode === 'ask') && (
+              <button
+                className={`voice-capture${voiceState === 'recording' ? ' is-recording' : ''}`}
+                type="button"
+                aria-pressed={voiceState === 'recording'}
+                disabled={
+                  voiceState === 'transcribing' ||
+                  isEditingNote ||
+                  (isVoiceEditing && !voiceEditSelection)
+                }
+                {...voicePointerHandlers}
+              >
+                <span className="voice-indicator" aria-hidden="true" />
+                {voiceState === 'recording'
+                  ? isVoiceEditing
+                    ? 'Release to replace selection'
+                    : captureMode === 'ask'
+                      ? 'Release to ask Margin'
+                      : 'Release to finish thought'
+                  : voiceState === 'transcribing'
+                    ? 'Transcribing…'
+                    : isVoiceEditing
+                      ? voiceEditSelection
+                        ? 'Hold to replace selection'
+                        : 'Choose a word to edit'
+                      : speechSettings.apiKey
+                        ? captureMode === 'ask'
+                          ? 'Hold to ask Margin'
+                          : 'Hold to speak a thought'
+                        : 'Add API key to speak'}
+              </button>
+            )}
+            {voiceState !== 'idle' && (
+              <div
+                className={`voice-status${voiceState === 'error' ? ' has-error' : ''}`}
+                role="status"
+              >
+                {voiceState === 'recording'
+                  ? isVoiceEditing
+                    ? 'Listening — release to replace the selected words.'
+                    : captureMode === 'ask'
+                      ? 'Listening — release to ask Margin.'
+                      : 'Listening — release to finish your thought.'
+                  : voiceState === 'transcribing'
+                    ? captureMode === 'ask'
+                      ? 'Finishing your question…'
+                      : 'Writing your thought in the margin…'
+                    : voiceError}
+              </div>
+            )}
+            {visibleRelatedThought && activeParagraphIndex !== null && (
+              <section
+                className="related-thought"
+                aria-label="A thought from your margins"
+              >
+                <div className="related-thought-heading">
+                  <span className="related-thought-kicker">
+                    A THOUGHT RETURNS
+                  </span>
+                  <time dateTime={visibleRelatedThought.createdAt}>
+                    {new Intl.DateTimeFormat(undefined, {
+                      month: 'short',
+                      day: 'numeric',
+                    }).format(new Date(visibleRelatedThought.createdAt))}
+                  </time>
+                </div>
+                <blockquote>{visibleRelatedThought.note}</blockquote>
+                <p className="related-thought-source">
+                  From {visibleRelatedThought.articleTitle ?? ARTICLE_TITLE}
+                </p>
+                <div className="related-thought-actions">
+                  <button
+                    className="text-button"
+                    type="button"
+                    onClick={() =>
+                      returnToRelatedPassage(
+                        visibleRelatedThought.paragraphIndex,
+                      )
+                    }
+                  >
+                    Return to that passage <span aria-hidden="true">↗</span>
+                  </button>
+                  <button
+                    className="text-button text-button-subtle"
+                    type="button"
+                    onClick={() =>
+                      void dismissRelatedThought(visibleRelatedThought)
+                    }
+                  >
+                    Not related
+                  </button>
+                </div>
+              </section>
+            )}
+            {isMemoryPending && activeNote && (
+              <p className="memory-pending" role="status">
+                Looking through your margins…
+              </p>
+            )}
+            {hasMemoryError &&
+              activeParagraphIndex !== null &&
+              Object.values(notes).some((note) => note.trim()) && (
+                <p className="memory-error" role="status">
+                  Your note is saved here. Margin connections are temporarily
+                  unavailable.
+                </p>
+              )}
+            {!speechSettings.apiKey &&
+              activeParagraphIndex !== null &&
+              Object.keys(notes).length > 0 &&
+              !visibleRelatedThought && (
+                <p className="memory-pending">
+                  Add an NVIDIA key in Settings to find returning thoughts.
+                </p>
+              )}
             <p className="rail-footnote">
-              Notes stay with their passage on this device.
+              {speechSettings.apiKey
+                ? 'Thoughts stay with their passage and can return when a later passage echoes them.'
+                : 'Thoughts stay with their passage on this device.'}
             </p>
           </aside>
         </main>
+
+        {selectionMenu && (
+          <div
+            className="selection-menu"
+            role="toolbar"
+            aria-label="Selected text"
+            style={{ top: selectionMenu.top, left: selectionMenu.left }}
+            onPointerDown={(event) => event.preventDefault()}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                selectParagraph(selectionMenu.paragraphIndex)
+                setAskQuote({
+                  text: selectionMenu.text,
+                  paragraphIndex: selectionMenu.paragraphIndex,
+                  id: Date.now(),
+                })
+                setCaptureMode('ask')
+                setHasOpenedAsk(true)
+                setMarginOpen(true)
+                setSelectionMenu(null)
+                window.getSelection()?.removeAllRanges()
+              }}
+            >
+              <span aria-hidden="true">✳</span> Ask Margin
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const index = selectionMenu.paragraphIndex
+                selectParagraph(index)
+                setCaptureMode('thought')
+                setMarginOpen(true)
+                const quoted = `“${selectionMenu.text}” — `
+                setNoteDraft(
+                  notes[index] ? `${notes[index]}\n\n${quoted}` : quoted,
+                )
+                setIsEditingNote(true)
+                setSelectionMenu(null)
+                window.getSelection()?.removeAllRanges()
+              }}
+            >
+              <span aria-hidden="true">✎</span> Note this
+            </button>
+          </div>
+        )}
 
         <div className="keyboard-hint" aria-hidden="true">
           <span className="keyboard-key">SPACE</span>

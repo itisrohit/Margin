@@ -56,7 +56,12 @@ class CompanionContractTests(unittest.IsolatedAsyncioTestCase):
                     "/companion/ask", json=self.question, headers={"Authorization": "Bearer test"}
                 )
         events = [json.loads(line) for line in response.text.splitlines()]
-        self.assertEqual([e["type"] for e in events], ["sources", "delta", "done"])
+        kinds = [e["type"] for e in events]
+        self.assertEqual(kinds[0], "sources")
+        self.assertEqual(kinds[-1], "done")
+        self.assertEqual(set(kinds[1:-1]), {"delta"})
+        answer = "".join(e["text"] for e in events if e["type"] == "delta")
+        self.assertEqual(answer, "It depends on the task [1].")
         self.assertEqual(events[0]["sources"][0]["text"], self.question["context"][0])
         metrics = events[-1]["metrics"]
         self.assertGreaterEqual(metrics["totalMs"], metrics["firstAnswerMs"])
@@ -272,3 +277,66 @@ class CompanionMemoryTests(unittest.TestCase):
             earlierQuestions=["q"] * 30,
         )
         self.assertEqual(len(question.history), 32)
+
+
+class FollowUpSplitterTests(unittest.TestCase):
+    def run_stream(self, chunks: list[str]) -> tuple[str, list[str]]:
+        splitter = companion.FollowUpSplitter()
+        visible = "".join(splitter.feed(chunk) for chunk in chunks)
+        rest, questions = splitter.finish()
+        return visible + rest, questions
+
+    def test_marker_split_across_chunks_is_hidden(self):
+        text, questions = self.run_stream(
+            [
+                "My read is that focus is scarce [1].\n\n**FOLL",
+                "OW-UPS:** Is it trainable?",
+                " | What about flow states?",
+            ]
+        )
+        self.assertEqual(text, "My read is that focus is scarce [1].")
+        self.assertEqual(questions, ["Is it trainable?", "What about flow states?"])
+
+    def test_answer_without_marker_passes_through(self):
+        text, questions = self.run_stream(["A short ", "answer with no ", "follow-ups at all."])
+        self.assertEqual(text, "A short answer with no follow-ups at all.")
+        self.assertEqual(questions, [])
+
+    def test_lowercase_marker_and_list_format(self):
+        text, questions = self.run_stream(
+            ["Answer.\nFollow-ups:\n- First question here?\n- Second question here?"]
+        )
+        self.assertEqual(text, "Answer.")
+        self.assertEqual(questions, ["First question here?", "Second question here?"])
+
+
+class CompanionContextTests(unittest.TestCase):
+    def test_quote_outline_and_summary_reach_the_prompt(self):
+        question = companion.Question(
+            clientId=uuid4(),
+            question="Why this?",
+            articleUrl="https://example.com/a",
+            title="Attention",
+            paragraphIndex=1,
+            contextStart=0,
+            context=["One.", "Two."],
+            quote="a budget, not a spotlight",
+            outline=["Introduction", "History"],
+            notes=[{"paragraphIndex": 1, "text": "My note"}],
+        )
+        prompt = companion.build_prompt(question, [])
+        self.assertIn("highlighted these exact words", prompt)
+        self.assertIn("a budget, not a spotlight", prompt)
+        self.assertIn("Introduction > History", prompt)
+        note_source = {
+            "kind": "thought",
+            "title": "Attention",
+            "url": "https://example.com/a",
+            "paragraphIndex": 1,
+            "text": "My note",
+        }
+        self.assertEqual(
+            companion.describe_source(note_source, question),
+            "the reader's own note on the selected passage",
+        )
+        self.assertIn("Summary of the earlier conversation", companion.recap([], "They debated X."))
