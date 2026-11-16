@@ -62,8 +62,8 @@
   margin: 0 auto;
   padding-top: 88px;
   display: grid;
-  grid-template-columns: minmax(0, 680px) 220px;
-  gap: 92px;
+  grid-template-columns: minmax(0, 660px) 270px;
+  gap: 64px;
   align-items: start;
 }
 
@@ -242,6 +242,228 @@
   line-height: 1.6;
 }
 
+.add-note {
+  width: 100%;
+  margin-top: 16px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #ded8cc;
+  border-radius: 4px;
+  color: var(--ink-soft);
+  background: #fcfaf5;
+  cursor: pointer;
+  font-size: 11px;
+  text-align: left;
+  transition:
+    border-color 140ms ease,
+    background-color 140ms ease;
+}
+
+.add-note span {
+  color: var(--accent);
+  font-size: 16px;
+  line-height: 0.8;
+}
+
+.add-note:hover {
+  border-color: #cba18b;
+  background: #fffdf8;
+}
+
+.note-composer {
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px solid #e7dfd2;
+  border-radius: 7px;
+  background: #fffdf8;
+  box-shadow: 0 10px 28px rgba(53, 48, 36, 0.045);
+}
+
+.composer-label,
+.saved-note-label {
+  display: block;
+  margin: 0 0 13px;
+  color: #888477;
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.14em;
+}
+
+.composer-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.note-composer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.note-composer-header .composer-label {
+  margin-bottom: 0;
+}
+
+.composer-pencil {
+  color: var(--accent);
+  font-family: var(--serif);
+  font-size: 15px;
+  line-height: 0.8;
+}
+
+.note-composer textarea {
+  width: 100%;
+  min-height: 132px;
+  padding: 0;
+  resize: vertical;
+  border: 0;
+  outline: none;
+  color: var(--ink);
+  background: transparent;
+  font-family: var(--serif);
+  font-size: 17px;
+  line-height: 1.65;
+}
+
+.note-composer textarea::placeholder {
+  color: #aaa498;
+}
+
+.note-composer textarea:focus-visible {
+  outline: 2px solid rgba(186, 105, 76, 0.38);
+  outline-offset: 4px;
+}
+
+.note-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.composer-footer {
+  margin-top: 15px;
+  padding-top: 13px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid #eee8dd;
+}
+
+.save-note {
+  flex: 0 0 auto;
+  padding: 9px 12px;
+  border: 1px solid var(--ink);
+  border-radius: 5px;
+  color: #fffdf8;
+  background: var(--ink);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 550;
+  transition: opacity 140ms ease;
+}
+
+.save-note span {
+  margin-left: 3px;
+  color: #d8b3a1;
+}
+
+.save-note:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.save-note:focus-visible,
+.text-button:focus-visible,
+.add-note:focus-visible {
+  outline: 2px solid rgba(186, 105, 76, 0.58);
+  outline-offset: 3px;
+}
+
+.text-button {
+  padding: 4px 0;
+  border: 0;
+  color: #777368;
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.text-button:hover {
+  color: var(--ink);
+}
+
+.text-button.danger {
+  color: #9f5542;
+}
+
+.storage-note {
+  margin: 0;
+  color: #9a9589;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.saved-note {
+  margin-top: 20px;
+  padding: 17px 17px 15px;
+  border: 1px solid #e9dfcb;
+  border-left: 3px solid #d9ad96;
+  border-radius: 4px 7px 7px 4px;
+  background: #f4f0e5;
+  box-shadow: 0 8px 20px rgba(53, 48, 36, 0.035);
+}
+
+.saved-note-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.saved-note-label {
+  margin: 0;
+}
+
+.saved-note-status {
+  color: #a49b87;
+  font-size: 8px;
+  letter-spacing: 0.1em;
+}
+
+.saved-note-text {
+  margin: 17px 0 0;
+  color: #554c3b;
+  font-family: 'Bradley Hand', 'Segoe Print', 'Comic Sans MS', cursive;
+  font-size: 18px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.note-actions {
+  margin-top: 16px;
+  padding-top: 11px;
+  border-top: 1px solid rgba(165, 150, 119, 0.2);
+}
+
+.note-actions .text-button {
+  min-width: 42px;
+  padding: 5px 8px;
+  border: 1px solid rgba(165, 150, 119, 0.25);
+  border-radius: 4px;
+  background: rgba(255, 253, 248, 0.48);
+}
+
+.delete-prompt {
+  color: #777368;
+  font-size: 9px;
+}
+
 .keyboard-hint {
   position: fixed;
   right: 32px;
@@ -251,6 +473,10 @@
   gap: 8px;
   color: #858176;
   font-size: 10px;
+}
+
+.app-shell.is-note-editing .keyboard-hint {
+  display: none;
 }
 
 .keyboard-key {
