@@ -28,6 +28,22 @@ function loadArticle(): ImportedArticle | null {
   }
   return null
 }
+const LIBRARY_KEY = 'margin:article-library'
+function loadLibrary(): ImportedArticle[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LIBRARY_KEY) ?? '[]')
+    return Array.isArray(saved)
+      ? saved.filter(
+          (article) =>
+            article &&
+            typeof article.url === 'string' &&
+            Array.isArray(article.paragraphs),
+        )
+      : []
+  } catch {
+    return []
+  }
+}
 const importedArticle = loadArticle()
 const articleSuffix = importedArticle
   ? `:${encodeURIComponent(importedArticle.url)}`
@@ -690,6 +706,8 @@ function App() {
   const [articleUrl, setArticleUrl] = useState('')
   const [articleLoading, setArticleLoading] = useState(false)
   const [articleError, setArticleError] = useState('')
+  const [library, setLibrary] = useState<ImportedArticle[]>(loadLibrary)
+  const [libraryOpen, setLibraryOpen] = useState(false)
   const [activeParagraphIndex, setActiveParagraphIndex] = useState<
     number | null
   >(null)
@@ -769,6 +787,11 @@ function App() {
             ? result.detail
             : 'Could not open this article.',
         )
+      const savedLibrary = [
+        result as ImportedArticle,
+        ...library.filter((item) => item.url !== result.url),
+      ]
+      localStorage.setItem(LIBRARY_KEY, JSON.stringify(savedLibrary))
       localStorage.setItem('margin:current-article', JSON.stringify(result))
       window.location.reload()
     } catch (error) {
@@ -777,6 +800,17 @@ function App() {
       )
       setArticleLoading(false)
     }
+  }
+
+  const openSavedArticle = (article: ImportedArticle) => {
+    localStorage.setItem('margin:current-article', JSON.stringify(article))
+    window.location.reload()
+  }
+
+  const removeSavedArticle = (url: string) => {
+    const next = library.filter((article) => article.url !== url)
+    setLibrary(next)
+    localStorage.setItem(LIBRARY_KEY, JSON.stringify(next))
   }
 
   const focusedParagraphIndex = activeParagraphIndex
@@ -1740,6 +1774,46 @@ function App() {
         </button>
       </header>
 
+      <section className="library-bar" aria-label="Your reading library">
+        <button
+          type="button"
+          className="library-toggle"
+          aria-expanded={libraryOpen}
+          onClick={() => setLibraryOpen(!libraryOpen)}
+        >
+          <span>Reading library</span>
+          <span>{library.length} saved</span>
+          <span aria-hidden="true">{libraryOpen ? '−' : '+'}</span>
+        </button>
+        {libraryOpen && (
+          <div className="library-list">
+            {library.length === 0 ? (
+              <p>Your saved articles will appear here.</p>
+            ) : (
+              library.map((article) => (
+                <article className="library-item" key={article.url}>
+                  <button
+                    type="button"
+                    className="library-open"
+                    onClick={() => openSavedArticle(article)}
+                  >
+                    <strong>{article.title}</strong>
+                    <span>{new URL(article.url).hostname}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="library-remove"
+                    aria-label={`Remove ${article.title} from library`}
+                    onClick={() => removeSavedArticle(article.url)}
+                  >
+                    Remove
+                  </button>
+                </article>
+              ))
+            )}
+          </div>
+        )}
+      </section>
       <form
         className="article-import"
         onSubmit={(event) => void openArticle(event)}
