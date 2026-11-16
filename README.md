@@ -32,32 +32,32 @@ A voice-first reading workspace with a clean article reader, handwritten-style m
 
 ### Requirements
 
+- Bun 1.2.16 or newer
+- Python 3.13 and [uv](https://docs.astral.sh/uv/)
 - Docker Desktop or Docker Engine with Compose
-- Bun 1.2.16 or newer, if you want to use the convenience scripts
 - An NVIDIA API key with access to the configured speech, embedding, and chat models
 
-### Start the full stack
+### Start locally
 
 ```sh
 cp .env.example .env
-docker compose up --build
+bun install
+uv sync --directory api
+docker compose up -d db
+bun run dev
 ```
 
-This builds and starts PostgreSQL with pgvector, the FastAPI backend, and the Vite web app. The API waits for the database health check, and the web app waits for the API health check. Source files are mounted for live reload. `bun run dev` is a convenience alias. Host ports are configurable with `WEB_PORT`, `API_PORT`, and `POSTGRES_PORT` in `.env` if those defaults are already in use.
+This runs the web app and API on your machine and PostgreSQL in Docker. Open <http://localhost:5173>. The API runs at <http://127.0.0.1:8000>; its health check is <http://127.0.0.1:8000/health> and interactive API docs are at <http://127.0.0.1:8000/docs>.
 
-Open <http://localhost:5173>. The API runs at <http://127.0.0.1:8000>; its health check is <http://127.0.0.1:8000/health> and interactive API docs are at <http://127.0.0.1:8000/docs>.
-
-Use `bun run dev:logs` to follow the stack logs and `bun run dev:down` to stop the containers. PostgreSQL data stays in a named Docker volume. `bun run dev:host` keeps the older workflow for running the app processes directly on your machine.
+To run all three services in Docker instead, use `docker compose up --build` or `bun run dev:docker`. Use `bun run dev:logs` to follow container logs and `bun run dev:down` to stop the Docker stack. Host ports can be changed with `WEB_PORT`, `API_PORT`, and `POSTGRES_PORT` in `.env`.
 
 Add your NVIDIA API key in **Settings** in the app. The key is sent with requests that need NVIDIA and is not stored by the API. Article reading and extraction can be tried without enabling companion features.
 
-Stop the full stack while preserving the database volume with:
+Stop PostgreSQL while preserving its data with:
 
 ```sh
-docker compose down
+bun run db:down
 ```
-
-To stop only PostgreSQL, use `bun run db:down`.
 
 ## Data and privacy
 

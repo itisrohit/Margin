@@ -7,10 +7,10 @@
     "web"
   ],
   "scripts": {
-    "dev": "docker compose up --build",
+    "dev": "concurrently -k -n web,api -c cyan,magenta \"bun run --filter web dev\" \"uv run --directory api fastapi dev main.py --host 127.0.0.1\"",
     "dev:down": "docker compose down --remove-orphans",
     "dev:logs": "docker compose logs -f --tail=100",
-    "dev:host": "concurrently -k -n web,api -c cyan,magenta \"bun run --filter web dev\" \"uv run --directory api fastapi dev main.py --host 127.0.0.1\"",
+    "dev:host": "bun run dev",
     "dev:web": "bun run --filter web dev",
     "dev:api": "uv run --directory api fastapi dev main.py --host 127.0.0.1",
     "db:up": "docker compose up -d db",
@@ -19,7 +19,8 @@
     "format": "prettier --write \"web/**/*.{ts,tsx,js,jsx,css,json,md}\" \"*.{json,md,yml,yaml}\" && uv run --directory api ruff format .",
     "format:check": "prettier --check \"web/**/*.{ts,tsx,js,jsx,css,json,md}\" \"*.{json,md,yml,yaml}\" && uv run --directory api ruff format --check .",
     "typecheck": "bun run --filter web build && uv run --directory api ty check",
-    "check": "bun run lint && bun run format:check && bun run typecheck"
+    "check": "bun run lint && bun run format:check && bun run typecheck",
+    "dev:docker": "docker compose up --build"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
