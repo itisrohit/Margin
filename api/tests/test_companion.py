@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import unittest
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -107,7 +108,10 @@ class CompanionContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_library_scope_uses_owner_and_returns_retrieved_sources(self):
         owner = self.question["clientId"]
 
-        def provider(_):
+        prompts = []
+
+        def provider(request):
+            prompts.append(json.loads(request.content)["messages"][-1]["content"])
             return httpx.Response(
                 200,
                 text=(
@@ -129,6 +133,10 @@ class CompanionContractTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(companion, "ensure_schema"),
                 patch.object(companion, "query_vector", AsyncMock(return_value=([0.0], True))),
                 patch.object(companion, "search", return_value=[evidence]) as search,
+                patch.object(companion, "ensure_search_index"),
+                patch.object(
+                    companion, "library_titles", return_value=["Evidence", "Other article"]
+                ),
             ):
                 response = await self.client.post(
                     "/companion/ask",
@@ -140,6 +148,8 @@ class CompanionContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0]["sources"][1]["url"], evidence["url"])
         self.assertEqual(events[-1]["type"], "done")
         self.assertTrue(events[-1]["metrics"]["queryCacheHit"])
+        self.assertIn('library (2 articles): "Evidence"; "Other article"', prompts[0])
+        self.assertIn("compare them explicitly", prompts[0])
 
     async def test_failed_embedding_batch_splits_without_losing_order(self):
         requests = []
@@ -340,3 +350,111 @@ class CompanionContextTests(unittest.TestCase):
             "the reader's own note on the selected passage",
         )
         self.assertIn("Summary of the earlier conversation", companion.recap([], "They debated X."))
+
+
+class HybridRetrievalTests(unittest.TestCase):
+    def test_fusion_rewards_items_found_by_both_retrievers(self):
+        by_meaning = ["a1", "b1", "c1"]
+        by_words = ["c1", "d1"]
+        fused = companion.fuse(
+            [by_meaning, by_words], key=lambda x: x, group=lambda x: x[0], limit=4, per_group=3
+        )
+        self.assertEqual(fused[0], "c1")
+        self.assertEqual(set(fused), {"a1", "b1", "c1", "d1"})
+
+    def test_one_article_cannot_take_every_slot(self):
+        ranking = ["a1", "a2", "a3", "a4", "a5", "b1", "c1"]
+        fused = companion.fuse(
+            [ranking], key=lambda x: x, group=lambda x: x[0], limit=5, per_group=3
+        )
+        self.assertEqual(fused, ["a1", "a2", "a3", "b1", "c1"])
+
+    def test_keyword_query_is_safe_or_query(self):
+        self.assertEqual(
+            companion.keyword_query("What did Kahneman say about 'System 1' & attention?!"),
+            "what | did | kahneman | say | about | system | attention",
+        )
+        self.assertEqual(companion.keyword_query("?? !!"), "")
+
+
+@unittest.skipUnless(
+    os.getenv("RUN_POSTGRES_INTEGRATION") == "1",
+    "set RUN_POSTGRES_INTEGRATION=1 to run against local Postgres",
+)
+class HybridSearchIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        from sqlalchemy.orm import Session
+
+        from memory import EMBEDDING_DIMENSIONS, engine, ensure_schema
+
+        ensure_schema()
+        companion.ensure_search_index()
+        self.owner = uuid4()
+        self.engine = engine
+
+        def vector(axis: int) -> list[float]:
+            v = [0.0] * EMBEDDING_DIMENSIONS
+            v[axis] = 1.0
+            return v
+
+        self.query = vector(0)
+        rows = [
+            # Five near-identical matches from one article...
+            *[
+                companion.Passage(
+                    client_id=self.owner,
+                    article_url="https://a",
+                    position=i,
+                    fragment=0,
+                    version="v",
+                    title="Article A",
+                    content=f"Attention passage {i}",
+                    embedding=vector(0),
+                )
+                for i in range(5)
+            ],
+            companion.Passage(
+                client_id=self.owner,
+                article_url="https://b",
+                position=0,
+                fragment=0,
+                version="v",
+                title="Article B",
+                content="A related idea about focus",
+                embedding=vector(1),
+            ),
+            # ...and one passage whose embedding is far away but names the exact term.
+            companion.Passage(
+                client_id=self.owner,
+                article_url="https://c",
+                position=0,
+                fragment=0,
+                version="v",
+                title="Article C",
+                content="Kahneman described System 1 thinking",
+                embedding=vector(2),
+            ),
+        ]
+        with Session(engine) as session:
+            session.add_all(rows)
+            session.commit()
+
+    def tearDown(self):
+        from sqlalchemy import delete
+        from sqlalchemy.orm import Session
+
+        with Session(self.engine) as session:
+            session.execute(
+                delete(companion.Passage).where(companion.Passage.client_id == self.owner)
+            )
+            session.commit()
+
+    def test_hybrid_search_caps_articles_and_finds_exact_terms(self):
+        sources = companion.search(self.owner, self.query, "What did Kahneman argue?")
+        by_article = [s["url"] for s in sources if s["kind"] == "article"]
+        self.assertLessEqual(by_article.count("https://a"), companion.MAX_PER_ARTICLE)
+        self.assertIn("https://b", by_article)
+        self.assertIn("https://c", by_article)
+        self.assertEqual(
+            sorted(companion.library_titles(self.owner)), ["Article A", "Article B", "Article C"]
+        )

@@ -6,6 +6,7 @@ import json
 import os
 import re
 from collections import OrderedDict
+from collections.abc import Callable, Hashable
 from time import perf_counter
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -15,7 +16,7 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import String, Text, delete, select
+from sqlalchemy import String, Text, delete, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Mapped, Session, mapped_column
 from starlette.concurrency import run_in_threadpool
@@ -267,35 +268,142 @@ async def index_article(article: Article, authorization: str | None = Header(def
     return {"indexed": True, "cached": False, "passages": len(parts)}
 
 
-def search(owner: UUID, vector: list[float]) -> list[dict]:
+CANDIDATES = 40  # per retriever, before fusion
+MAX_PASSAGES = 10
+MAX_PER_ARTICLE = 3
+MAX_THOUGHTS = 4
+RRF_K = 60
+_search_index_ready = False
+
+
+def ensure_search_index() -> None:
+    """Full-text indexes so keyword retrieval stays fast as the library grows."""
+    global _search_index_ready
+    if _search_index_ready:
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_article_passages_fts ON article_passages "
+                "USING gin (to_tsvector('english', content))"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_thoughts_fts ON thoughts "
+                "USING gin (to_tsvector('english', note))"
+            )
+        )
+    _search_index_ready = True
+
+
+def keyword_query(question: str) -> str:
+    """An OR query over the question's content words; safe for to_tsquery."""
+    words = [w.lower() for w in re.findall(r"[A-Za-z0-9]{3,}", question)]
+    return " | ".join(dict.fromkeys(words[:16]))
+
+
+def fuse(
+    rankings: list[list[Any]],
+    key: Callable[[Any], Hashable],
+    group: Callable[[Any], Hashable],
+    limit: int,
+    per_group: int,
+) -> list[Any]:
+    """Reciprocal rank fusion, then cap how many results one group may take."""
+    scores: dict[Hashable, float] = {}
+    items: dict[Hashable, Any] = {}
+    for ranking in rankings:
+        for rank, item in enumerate(ranking):
+            identity = key(item)
+            items.setdefault(identity, item)
+            scores[identity] = scores.get(identity, 0.0) + 1.0 / (RRF_K + rank + 1)
+    picked: list[Any] = []
+    counts: dict[Hashable, int] = {}
+    for identity in sorted(scores, key=scores.__getitem__, reverse=True):
+        item = items[identity]
+        bucket = group(item)
+        if counts.get(bucket, 0) >= per_group:
+            continue
+        counts[bucket] = counts.get(bucket, 0) + 1
+        picked.append(item)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def search(owner: UUID, vector: list[float], question: str = "") -> list[dict]:
+    """Hybrid retrieval across the reader's library: meaning plus exact words."""
+    terms = keyword_query(question)
     with Session(engine) as session:
-        sources: list[dict[str, Any]] = []
-        for model, limit in ((Passage, 6), (ThoughtRecord, 3)):
-            distance = model.embedding.cosine_distance(vector)
-            rows = session.scalars(
+
+        def ranked(model, content, limit: int) -> list[list[Any]]:
+            by_meaning = session.scalars(
                 select(model)
                 .where(model.client_id == owner)
-                .order_by(
-                    distance,
-                )
+                .order_by(model.embedding.cosine_distance(vector))
                 .limit(limit)
             ).all()
-            for row in rows:
-                sources.append(
-                    {
-                        "kind": "article" if isinstance(row, Passage) else "thought",
-                        "title": row.title if isinstance(row, Passage) else row.article_title,
-                        "url": row.article_url,
-                        "createdAt": None
-                        if isinstance(row, Passage)
-                        else row.created_at.isoformat(),
-                        "paragraphIndex": row.position
-                        if isinstance(row, Passage)
-                        else row.paragraph_index,
-                        "text": row.content if isinstance(row, Passage) else row.note,
-                    }
-                )
+            if not terms:
+                return [list(by_meaning)]
+            document = func.to_tsvector("english", content)
+            query = func.to_tsquery("english", terms)
+            by_words = session.scalars(
+                select(model)
+                .where(model.client_id == owner, document.op("@@")(query))
+                .order_by(func.ts_rank_cd(document, query).desc())
+                .limit(limit)
+            ).all()
+            return [list(by_meaning), list(by_words)]
+
+        passages = fuse(
+            ranked(Passage, Passage.content, CANDIDATES),
+            key=lambda row: (row.article_url, row.position, row.fragment),
+            group=lambda row: row.article_url,
+            limit=MAX_PASSAGES,
+            per_group=MAX_PER_ARTICLE,
+        )
+        thoughts = fuse(
+            ranked(ThoughtRecord, ThoughtRecord.note, CANDIDATES // 2),
+            key=lambda row: row.id,
+            group=lambda row: row.article_url,
+            limit=MAX_THOUGHTS,
+            per_group=2,
+        )
+        sources = [
+            {
+                "kind": "article",
+                "title": row.title,
+                "url": row.article_url,
+                "createdAt": None,
+                "paragraphIndex": row.position,
+                "text": row.content,
+            }
+            for row in passages
+        ]
+        sources.extend(
+            {
+                "kind": "thought",
+                "title": row.article_title,
+                "url": row.article_url,
+                "createdAt": row.created_at.isoformat(),
+                "paragraphIndex": row.paragraph_index,
+                "text": row.note,
+            }
+            for row in thoughts
+        )
         return sources
+
+
+def library_titles(owner: UUID, limit: int = 60) -> list[str]:
+    with Session(engine) as session:
+        rows = session.execute(
+            select(Passage.title, func.max(Passage.position))
+            .where(Passage.client_id == owner)
+            .group_by(Passage.article_url, Passage.title)
+            .limit(limit)
+        ).all()
+        return [title for title, _ in rows]
 
 
 SYSTEM_PROMPT = (
@@ -350,7 +458,9 @@ def describe_source(source: dict[str, Any], question: "Question") -> str:
     return "nearby in this article"
 
 
-def build_prompt(question: "Question", sources: list[dict[str, Any]]) -> str:
+def build_prompt(
+    question: "Question", sources: list[dict[str, Any]], library: list[str] | None = None
+) -> str:
     passages = "\n\n".join(
         f"[{source['id']}] ({describe_source(source, question)})\n{source['text']}"
         for source in sources
@@ -367,10 +477,21 @@ def build_prompt(question: "Question", sources: list[dict[str, Any]]) -> str:
         if question.quote.strip()
         else ""
     )
+    shelf = ""
+    if question.scope == "library":
+        shelf = (
+            f"The reader's library ({len(library or [])} articles): "
+            + "; ".join(f'"{t}"' for t in (library or []))
+            + "\nOnly some passages were retrieved below. When several articles bear on the "
+            "question, compare them explicitly: where they agree, where they differ, and "
+            "under what conditions. Name the articles. If the library likely covers more "
+            "than the retrieved passages show, say so rather than overgeneralising.\n"
+        )
     return (
         f'Article: "{question.title}"\n'
         f"{outline}"
-        f"Answering from: {scope}\n\n"
+        f"Answering from: {scope}\n"
+        f"{shelf}\n"
         f"Passages:\n{passages or '(none found)'}\n"
         f"{quote}\n"
         f"Reader: {question.question}"
@@ -476,6 +597,7 @@ async def ask(
             }
             for index, content in enumerate(question.context)
         ]
+        library: list[str] = []
         try:
             if question.scope == "library":
                 await run_in_threadpool(ensure_schema)
@@ -488,12 +610,16 @@ async def ask(
                 timing["embeddingMs"] = round((perf_counter() - tick) * 1000, 1)
                 timing["queryCacheHit"] = hit
                 tick = perf_counter()
-                sources.extend(
-                    await run_in_threadpool(
-                        search,
-                        question.client_id,
-                        vector,
-                    )
+                await run_in_threadpool(ensure_search_index)
+                found, titles = await asyncio.gather(
+                    run_in_threadpool(search, question.client_id, vector, retrieval_question),
+                    run_in_threadpool(library_titles, question.client_id),
+                )
+                sources.extend(found)
+                library = titles
+                timing["libraryArticles"] = len(titles)
+                timing["retrievedArticles"] = len(
+                    {s["url"] for s in found if s["kind"] == "article"}
                 )
                 timing["searchMs"] = round((perf_counter() - tick) * 1000, 1)
             # The reader's own notes on this article are first-class context.
@@ -518,7 +644,7 @@ async def ask(
                 # a retrieved fragment of the same paragraph.
                 unique.setdefault(anchor, source)
             sources = []
-            remaining = 24000
+            remaining = 30000
             for source in unique.values():
                 if remaining <= 0:
                     break
@@ -532,7 +658,7 @@ async def ask(
                 {"role": "system", "content": SYSTEM_PROMPT + recap(earlier, question.summary)}
             ]
             messages.extend(turn.model_dump() for turn in history)
-            messages.append({"role": "user", "content": build_prompt(question, sources)})
+            messages.append({"role": "user", "content": build_prompt(question, sources, library)})
             first = True
             splitter = FollowUpSplitter()
             tick = perf_counter()
