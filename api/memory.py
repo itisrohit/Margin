@@ -186,7 +186,7 @@ def serialize_thought(record: ThoughtRecord, score: float) -> dict[str, object]:
     }
 
 
-@router.put("/{source_key}")
+@router.put("/{source_key:path}")
 async def save_thought(
     source_key: str,
     thought: ThoughtInput,

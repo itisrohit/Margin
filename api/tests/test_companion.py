@@ -180,3 +180,95 @@ class CompanionContractTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompanionPromptTests(unittest.TestCase):
+    def setUp(self):
+        self.question = companion.Question(
+            clientId=uuid4(),
+            question="What is your opinion on this?",
+            articleUrl="https://example.com/a",
+            title="Attention",
+            paragraphIndex=3,
+            contextStart=2,
+            context=["Attention is selective focus.", "History"],
+        )
+        self.sources = [
+            {
+                "id": 1,
+                "kind": "article",
+                "title": "Attention",
+                "url": "https://example.com/a",
+                "paragraphIndex": 2,
+                "text": "Attention is selective focus.",
+            },
+            {
+                "id": 2,
+                "kind": "article",
+                "title": "Attention",
+                "url": "https://example.com/a",
+                "paragraphIndex": 3,
+                "text": "History",
+            },
+            {
+                "id": 3,
+                "kind": "thought",
+                "title": "Other",
+                "url": "https://example.com/b",
+                "paragraphIndex": 0,
+                "text": "My note.",
+            },
+        ]
+
+    def test_prompt_labels_sources_without_leaking_indexes(self):
+        prompt = companion.build_prompt(self.question, self.sources)
+        self.assertIn("[2] (the reader's selection; it is a short heading", prompt)
+        self.assertIn("[1] (nearby in this article)", prompt)
+        self.assertIn("[3] (the reader's own note", prompt)
+        self.assertNotIn("paragraphIndex", prompt)
+        self.assertNotIn("{", prompt)
+
+    def test_system_prompt_invites_a_view(self):
+        self.assertIn("give one", companion.SYSTEM_PROMPT)
+        self.assertIn("Never mention paragraph indexes", companion.SYSTEM_PROMPT)
+
+
+class CompanionMemoryTests(unittest.TestCase):
+    def pair(self, n: int, size: int = 10) -> list[companion.Turn]:
+        return [
+            companion.Turn(role="user", content=f"question {n}"),
+            companion.Turn(role="assistant", content="a" * size),
+        ]
+
+    def test_short_history_kept_verbatim(self):
+        history = self.pair(1) + self.pair(2)
+        kept, earlier = companion.fit_history(history, [])
+        self.assertEqual(kept, history)
+        self.assertEqual(earlier, [])
+
+    def test_oldest_turns_become_recap_when_over_budget(self):
+        history = [t for n in range(6) for t in self.pair(n, 6000)]
+        kept, earlier = companion.fit_history(history, ["very first question"])
+        self.assertEqual(kept[-2].content, "question 5")
+        self.assertLessEqual(sum(len(t.content) for t in kept), companion.HISTORY_CHAR_BUDGET)
+        self.assertEqual(kept[0].role, "user")
+        self.assertEqual(earlier[0], "very first question")
+        self.assertIn("question 0", earlier)
+        self.assertIn("question 0", companion.recap(earlier))
+
+    def test_recap_empty_without_earlier_questions(self):
+        self.assertEqual(companion.recap([]), "")
+
+    def test_request_accepts_long_conversation(self):
+        question = companion.Question(
+            clientId=uuid4(),
+            question="And now?",
+            articleUrl="https://example.com",
+            title="T",
+            paragraphIndex=0,
+            contextStart=0,
+            context=["text"],
+            history=[t for n in range(16) for t in self.pair(n)],
+            earlierQuestions=["q"] * 30,
+        )
+        self.assertEqual(len(question.history), 32)

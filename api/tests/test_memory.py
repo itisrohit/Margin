@@ -313,3 +313,20 @@ class PostgresMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThoughtRouteTests(unittest.TestCase):
+    def test_save_route_accepts_source_keys_containing_urls(self):
+        from starlette.routing import Match
+
+        key = "https://en.wikipedia.org/wiki/Attention:1"
+        scope = {
+            "type": "http",
+            "method": "PUT",
+            "path": f"/thoughts/{key}",
+            "root_path": "",
+        }
+        route = next(r for r in memory.router.routes if "PUT" in getattr(r, "methods", ()))
+        match, child = route.matches(scope)
+        self.assertEqual(match, Match.FULL)
+        self.assertEqual(child["path_params"]["source_key"], key)

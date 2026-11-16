@@ -737,6 +737,7 @@ function App() {
   const [library, setLibrary] = useState<ImportedArticle[]>(loadLibrary)
   const [libraryOpen, setLibraryOpen] = useState(false)
   const [captureMode, setCaptureMode] = useState<'thought' | 'ask'>('thought')
+  const [hasOpenedAsk, setHasOpenedAsk] = useState(false)
   const [voiceQuestion, setVoiceQuestion] = useState<VoiceQuestion | null>(null)
   const [voiceDraft, setVoiceDraft] = useState('')
   const releasedAtRef = useRef(0)
@@ -2142,6 +2143,7 @@ function App() {
                 }
                 onClick={() => {
                   setCaptureMode('ask')
+                  setHasOpenedAsk(true)
                   setIsVoiceEditing(false)
                   setIsEditingNote(false)
                 }}
@@ -2149,8 +2151,14 @@ function App() {
                 Ask Margin
               </button>
             </div>
-            {captureMode === 'ask' && (
+            {hasOpenedAsk && (
               <Companion
+                hidden={captureMode !== 'ask'}
+                passageLabel={
+                  activeParagraphIndex === null
+                    ? null
+                    : `passage ${activeParagraphIndex + 1}`
+                }
                 apiUrl={API_URL}
                 apiKey={speechSettings.apiKey}
                 clientId={getClientId()}

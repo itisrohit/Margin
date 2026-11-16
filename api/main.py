@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
 from articles import router as articles_router
+from chats import router as chats_router
 from companion import close_client
 from companion import router as companion_router
 from memory import router as memory_router
@@ -43,6 +44,7 @@ app.add_middleware(
 app.include_router(memory_router)
 app.include_router(articles_router)
 app.include_router(companion_router)
+app.include_router(chats_router)
 
 
 class SpeechModel(TypedDict):
