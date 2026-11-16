@@ -2,6 +2,67 @@ import { useState } from 'react'
 import './App.css'
 
 const NOTES_STORAGE_KEY = 'margin:sample-essay:notes'
+const SPEECH_SETTINGS_KEY = 'margin:speech-settings'
+
+const speechModels = [
+  {
+    id: 'cache-aware-parakeet-rnnt-en-US-asr-streaming-sortformer',
+    name: 'Nemotron ASR',
+    detail: 'English · Live streaming',
+    mode: 'Shows transcription while you speak.',
+  },
+  {
+    id: 'parakeet-rnnt-1.1b-unified-ml-cs-universal-multi-asr-streaming-silero-vad-sortformer',
+    name: 'Parakeet RNNT 1.1B',
+    detail: '25 languages · Live streaming',
+    mode: 'Shows transcription while you speak.',
+  },
+  {
+    id: 'parakeet-rnnt-1.1b-unified-ml-cs-universal-multi-asr-offline-silero-vad-sortformer',
+    name: 'Parakeet RNNT 1.1B',
+    detail: '25 languages · Batch',
+    mode: 'Returns transcription after recording finishes.',
+  },
+  {
+    id: 'parakeet-tdt-0.6b-en-US-asr-offline',
+    name: 'Parakeet TDT 0.6B',
+    detail: 'English · Batch',
+    mode: 'Returns transcription after recording finishes.',
+  },
+  {
+    id: 'canary-1b-flash-multi-asr-offline',
+    name: 'Canary 1B',
+    detail: 'Multilingual · Batch',
+    mode: 'Returns transcription after recording finishes.',
+  },
+] as const
+
+type SpeechModelId = (typeof speechModels)[number]['id']
+type SpeechSettings = { apiKey: string; modelId: SpeechModelId }
+const DEFAULT_SPEECH_MODEL_ID: SpeechModelId = speechModels[0].id
+
+function loadSpeechSettings(): SpeechSettings {
+  try {
+    const stored = window.localStorage.getItem(SPEECH_SETTINGS_KEY)
+    const parsed: unknown = stored ? JSON.parse(stored) : null
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      'apiKey' in parsed &&
+      typeof parsed.apiKey === 'string'
+    ) {
+      const modelId =
+        'modelId' in parsed &&
+        speechModels.some((model) => model.id === parsed.modelId)
+          ? (parsed.modelId as SpeechModelId)
+          : DEFAULT_SPEECH_MODEL_ID
+      return { apiKey: parsed.apiKey, modelId }
+    }
+  } catch {
+    // Settings are optional; use the defaults if browser storage is unavailable.
+  }
+  return { apiKey: '', modelId: DEFAULT_SPEECH_MODEL_ID }
+}
 
 const paragraphs = [
   'We tend to treat a thought as a thing that arrives finished. It appears, clear and self-contained, and we decide whether to keep it or let it go. But most ideas begin less like sentences and more like weather: a change in pressure, a small disturbance at the edge of attention.',
@@ -56,6 +117,14 @@ function App() {
   const [isEditingNote, setIsEditingNote] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
   const [storageWarning, setStorageWarning] = useState(false)
+  const [speechSettings, setSpeechSettings] = useState<SpeechSettings>(loadSpeechSettings)
+  const [settingsDraft, setSettingsDraft] = useState<SpeechSettings>({
+    apiKey: '',
+    modelId: DEFAULT_SPEECH_MODEL_ID,
+  })
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
+  const [settingsSaved, setSettingsSaved] = useState(false)
+  const [settingsStorageError, setSettingsStorageError] = useState(false)
 
   const focusedParagraphIndex = activeParagraphIndex
   const focusedParagraph =
@@ -94,6 +163,21 @@ function App() {
           <span className="sample-dot" />
           Sample reading
         </span>
+        <button
+          className="settings-trigger"
+          type="button"
+          aria-label="Open settings"
+          onClick={() => {
+            setSettingsDraft(speechSettings)
+            setSettingsSaved(false)
+            setSettingsStorageError(false)
+            setIsSettingsOpen(true)
+          }}
+        >
+          <span aria-hidden="true">⚙</span>
+          Settings
+          {speechSettings.apiKey && <span className="settings-indicator" aria-label="API key saved" />}
+        </button>
       </header>
 
       <main className="reader-layout" id="top">
@@ -315,6 +399,122 @@ function App() {
         <span>to capture a thought</span>
         <span className="hint-soon">coming soon</span>
       </div>
+
+      {isSettingsOpen && (
+        <div
+          className="settings-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setIsSettingsOpen(false)
+          }}
+        >
+          <section
+            className="settings-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="settings-title"
+          >
+            <div className="settings-heading">
+              <div>
+                <p className="eyebrow">YOUR WORKSPACE</p>
+                <h2 id="settings-title">Voice settings</h2>
+              </div>
+              <button
+                className="settings-close"
+                type="button"
+                aria-label="Close settings"
+                onClick={() => setIsSettingsOpen(false)}
+              >
+                ×
+              </button>
+            </div>
+            <p className="settings-intro">
+              Choose one of the speech models verified with your NVIDIA NIM key.
+            </p>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault()
+                try {
+                  window.localStorage.setItem(SPEECH_SETTINGS_KEY, JSON.stringify(settingsDraft))
+                  setSpeechSettings(settingsDraft)
+                  setSettingsSaved(true)
+                  setSettingsStorageError(false)
+                } catch {
+                  setSettingsSaved(false)
+                  setSettingsStorageError(true)
+                }
+              }}
+            >
+              <p className="settings-provider">NVIDIA NIM</p>
+              <label className="settings-label" htmlFor="speech-api-key">NVIDIA NIM API key</label>
+              <input
+                id="speech-api-key"
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="Paste your NVIDIA NIM API key"
+                value={settingsDraft.apiKey}
+                onChange={(event) => {
+                  setSettingsDraft({ ...settingsDraft, apiKey: event.target.value })
+                  setSettingsSaved(false)
+                }}
+              />
+              <label className="settings-label" htmlFor="speech-model">Speech model</label>
+              <select
+                id="speech-model"
+                value={settingsDraft.modelId}
+                onChange={(event) => {
+                  setSettingsDraft({
+                    ...settingsDraft,
+                    modelId: event.target.value as SpeechModelId,
+                  })
+                  setSettingsSaved(false)
+                }}
+              >
+                {speechModels.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.name} — {model.detail}
+                  </option>
+                ))}
+              </select>
+              <p className="settings-model-note">
+                {speechModels.find((model) => model.id === settingsDraft.modelId)?.mode}
+              </p>
+              <p className="settings-storage-note">
+                Key and selection are saved in this browser. Voice capture is not connected yet.
+              </p>
+              <div className="settings-footer">
+                {settingsStorageError ? (
+                  <span className="settings-feedback error">Could not save in browser storage.</span>
+                ) : settingsSaved ? (
+                  <span className="settings-feedback">Key saved on this device.</span>
+                ) : speechSettings.apiKey ? (
+                  <button
+                    className="text-button danger"
+                    type="button"
+                    onClick={() => {
+                      try {
+                        window.localStorage.removeItem(SPEECH_SETTINGS_KEY)
+                        const cleared = { ...settingsDraft, apiKey: '' }
+                        setSettingsDraft(cleared)
+                        setSpeechSettings(cleared)
+                        window.localStorage.setItem(SPEECH_SETTINGS_KEY, JSON.stringify(cleared))
+                        setSettingsSaved(false)
+                      } catch {
+                        setSettingsStorageError(true)
+                      }
+                    }}
+                  >
+                    Remove saved key
+                  </button>
+                ) : <span />}
+                <button className="save-note settings-save" type="submit" disabled={!settingsDraft.apiKey.trim()}>
+                  Save settings <span aria-hidden="true">↗</span>
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      )}
     </div>
   )
 }
