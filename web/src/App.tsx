@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
+import { ArticleOutline } from './ArticleOutline'
 
 type ImportedArticle = {
   url: string
@@ -452,6 +453,19 @@ const paragraphs = importedArticle?.paragraphs ?? [
   'Over time, those traces begin to speak to one another. A thought from an article about attention might resurface beside a passage about friendship. The connection was not obvious when either piece was read. It becomes visible only because both were given a little room.',
   'Maybe that is all a margin needs to be: a place for the conversation between what we read and what we bring to it. The page holds the words. Beside them, there is room for whatever they set in motion.',
 ]
+
+const articleSections = paragraphs.flatMap((text, index) =>
+  importedArticle?.blocks
+    ? importedArticle.blocks[index]?.type === 'heading'
+      ? [{ index, title: text }]
+      : []
+    : index === 0 || index % 3 === 0
+      ? [{ index, title: `Passage ${index + 1}` }]
+      : [],
+)
+if (articleSections.length && articleSections[0].index !== 0) {
+  articleSections.unshift({ index: 0, title: 'Introduction' })
+}
 
 type RelatedThought = {
   id?: string
@@ -1759,6 +1773,7 @@ function App() {
           </button>
         )}
       </form>
+      <ArticleOutline sections={articleSections} />
       <main className="reader-layout" id="top">
         <article className="article">
           <div className="article-heading">
